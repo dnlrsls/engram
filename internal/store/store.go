@@ -2027,10 +2027,11 @@ func (s *Store) CreateSession(id, project, directory string) error {
 	})
 }
 
-func (s *Store) EndSession(id string, summary string) error {
-	return s.withTx(func(tx *sql.Tx) error {
+func (s *Store) EndSession(id string, summary string) (bool, error) {
+	changed := false
+	err := s.withTx(func(tx *sql.Tx) error {
 		res, err := s.execHook(tx,
-			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ?`,
+			`UPDATE sessions SET ended_at = datetime('now'), summary = ? WHERE id = ? AND ended_at IS NULL`,
 			nullableString(summary), id,
 		)
 		if err != nil {
@@ -2041,9 +2042,15 @@ func (s *Store) EndSession(id string, summary string) error {
 			return err
 		}
 		if rows == 0 {
+			var exists int
+			if err := tx.QueryRow(`SELECT 1 FROM sessions WHERE id = ?`, id).Scan(&exists); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+				}
+				return err
+			}
 			return nil
 		}
-
 		var startedAt, endedAt string
 		var project, directory string
 		var storedSummary *string
@@ -2054,15 +2061,20 @@ func (s *Store) EndSession(id string, summary string) error {
 			return err
 		}
 
-		return s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
+		if err := s.enqueueSyncMutationTx(tx, SyncEntitySession, id, SyncOpUpsert, syncSessionPayload{
 			ID:        id,
 			Project:   project,
 			Directory: directory,
 			StartedAt: startedAt,
 			EndedAt:   &endedAt,
 			Summary:   storedSummary,
-		})
+		}); err != nil {
+			return err
+		}
+		changed = true
+		return nil
 	})
+	return changed, err
 }
 
 func (s *Store) GetSession(id string) (*Session, error) {
@@ -2076,48 +2088,36 @@ func (s *Store) GetSession(id string) (*Session, error) {
 	return &sess, nil
 }
 
-// MostRecentActiveSession resolves the active (un-ended) session for a project
-// from the persisted sessions table. It returns the session ID and ok=true when
-// such a session exists, or ok=false when none does.
-//
-// This is the cross-process resolution that fixes issue #386: the SessionStart
-// hook registers a UUID session via the HTTP server (POST /sessions) in one
-// process, while mem_save runs in the separate MCP (stdio) process. The two
-// share only the SQLite store, so the active session must be read from disk —
-// never from in-memory state.
-//
-// Selection rules:
-//   - Scope to the (normalized) project.
-//   - Require ended_at IS NULL — ended sessions are never returned, so stale
-//     sessions naturally fall out without any explicit clearing step.
-//   - Exclude the manual-save fallback sessions (id LIKE 'manual-save%'); those
-//     are created by the fallback path itself and must not be resolved as "the
-//     active session", which would make resolution circular.
-//   - When multiple un-ended sessions exist, pick the MOST RECENT by
-//     started_at DESC, with id DESC as a deterministic tie-breaker.
-func (s *Store) MostRecentActiveSession(project string) (string, bool, error) {
+// ActiveRuntimeSessions returns every un-ended runtime-owned session for a
+// project. Manual buckets are excluded because they do not own lifecycle.
+func (s *Store) ActiveRuntimeSessions(project string) ([]string, error) {
 	project, _ = NormalizeProject(project)
 	if project == "" {
-		return "", false, nil
+		return nil, nil
 	}
 
-	var id string
-	err := s.db.QueryRow(`
+	rows, err := s.queryItHook(s.db, `
 		SELECT id
 		FROM sessions
 		WHERE LOWER(project) = ?
 		  AND ended_at IS NULL
 		  AND id NOT LIKE 'manual-save%'
-		ORDER BY datetime(started_at) DESC, id DESC
-		LIMIT 1
-	`, project).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
+		ORDER BY id ASC
+	`, project)
 	if err != nil {
-		return "", false, err
+		return nil, err
 	}
-	return id, true, nil
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *Store) RecentSessions(project string, limit int) ([]SessionSummary, error) {

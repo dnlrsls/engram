@@ -285,12 +285,19 @@ func (s *Server) handleEndSession(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&body)
 
-	if err := s.store.EndSession(id, body.Summary); err != nil {
+	changed, err := s.store.EndSession(id, body.Summary)
+	if err != nil {
+		if errors.Is(err, store.ErrSessionNotFound) {
+			jsonError(w, http.StatusNotFound, "session not found")
+			return
+		}
 		jsonError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	s.notifyWrite()
+	if changed {
+		s.notifyWrite()
+	}
 	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": "completed"})
 }
 

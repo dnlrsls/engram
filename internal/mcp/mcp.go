@@ -15,6 +15,7 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -77,6 +78,17 @@ func currentWorkingDirectory() string {
 }
 
 func ensureImplicitSessionWithCWD(s *store.Store, sessionID, project string) error {
+	existing, err := s.GetSession(sessionID)
+	if err == nil {
+		existingProject, _ := store.NormalizeProject(existing.Project)
+		if existingProject != project {
+			return &sessionProjectMismatchError{SessionID: sessionID, SessionProject: existingProject, ExplicitProject: project}
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	return s.CreateSession(sessionID, project, currentWorkingDirectory())
 }
 
@@ -1230,8 +1242,9 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 		if typ == "" {
 			typ = "manual"
 		}
-		if sessionID == "" {
-			sessionID = resolveFallbackSessionID(s, project)
+		sessionID, createManual, err := resolveAttributedSessionID(s, sessionID, project)
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
 		}
 		suggestedTopicKey := suggestTopicKey(typ, title, content)
 
@@ -1256,8 +1269,11 @@ func handleSave(s *store.Store, cfg MCPConfig, activity *SessionActivity) server
 			}
 		}
 
-		// Ensure the implicit MCP session exists with the current working directory.
-		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+		if createManual {
+			if err := ensureImplicitSessionWithCWD(s, sessionID, project); err != nil {
+				return mcp.NewToolResultError("Failed to create manual session: " + err.Error()), nil
+			}
+		}
 
 		truncated := len(content) > s.MaxObservationLength()
 
@@ -1566,6 +1582,7 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig, activity *SessionActivity) 
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		projectChoice, _ := req.GetArguments()["project"].(string)
+		_, explicitProjectProvided := req.GetArguments()["project"]
 		projectChoiceReason, _ := req.GetArguments()["project_choice_reason"].(string)
 		recoveryToken, _ := req.GetArguments()["recovery_token"].(string)
 		recoverySessionID := sessionID
@@ -1579,18 +1596,28 @@ func handleSavePrompt(s *store.Store, cfg MCPConfig, activity *SessionActivity) 
 			return true, activity.ValidateAmbiguousProjectRecoveryToken(recoverySessionID, recoveryToken, strings.TrimSpace(choice), res.AvailableProjects, res.Path)
 		}
 
-		detRes, err := resolveWriteProjectWithChoiceAndProcessOverride(projectChoice, projectChoiceReason, validateRecoveryToken, cfg.DefaultProject)
+		var detRes projectpkg.DetectionResult
+		var err error
+		if strings.TrimSpace(sessionID) != "" {
+			detRes, err = resolveSaveWriteProjectWithProcessOverride(s, projectChoice, explicitProjectProvided, projectChoiceReason, sessionID, validateRecoveryToken, cfg.DefaultProject)
+		} else {
+			detRes, err = resolveWriteProjectWithChoiceAndProcessOverride(projectChoice, projectChoiceReason, validateRecoveryToken, cfg.DefaultProject)
+		}
 		if err != nil {
 			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
 		}
 		project, _ := store.NormalizeProject(detRes.Project)
 
-		if sessionID == "" {
-			sessionID = resolveFallbackSessionID(s, project)
+		sessionID, createManual, err := resolveAttributedSessionID(s, sessionID, project)
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
 		}
 
-		// Ensure the implicit MCP session exists with the current working directory.
-		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+		if createManual {
+			if err := ensureImplicitSessionWithCWD(s, sessionID, project); err != nil {
+				return mcp.NewToolResultError("Failed to create manual session: " + err.Error()), nil
+			}
+		}
 
 		_, err = s.AddPrompt(store.AddPromptParams{
 			SessionID: sessionID,
@@ -1904,12 +1931,16 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 
 		project, _ = store.NormalizeProject(project)
 
-		if sessionID == "" {
-			sessionID = resolveFallbackSessionID(s, project)
+		sessionID, createManual, err := resolveAttributedSessionID(s, sessionID, project)
+		if err != nil {
+			return writeProjectErrorResult(activity, recoverySessionID, detRes, err), nil
 		}
 
-		// Ensure the implicit MCP session exists with the current working directory.
-		_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+		if createManual {
+			if err := ensureImplicitSessionWithCWD(s, sessionID, project); err != nil {
+				return mcp.NewToolResultError("Failed to create manual session: " + err.Error()), nil
+			}
+		}
 
 		_, err = s.AddObservation(store.AddObservationParams{
 			SessionID: sessionID,
@@ -1921,10 +1952,15 @@ func handleSessionSummary(s *store.Store, cfg MCPConfig, activity *SessionActivi
 		if err != nil {
 			return mcp.NewToolResultError("Failed to save session summary: " + err.Error()), nil
 		}
+		if activity != nil {
+			activity.RecordSave(sessionID)
+		}
 
 		msg := fmt.Sprintf("Session summary saved for project %q", project)
-		if score := activity.ActivityScore(defaultSessionID(project)); score != "" {
-			msg += "\n" + score
+		if activity != nil {
+			if score := activity.ActivityScore(sessionID); score != "" {
+				msg += "\n" + score
+			}
 		}
 		detRes.Project = project
 		return respondWithProject(detRes, msg, nil), nil
@@ -1944,7 +1980,6 @@ func handleSessionStart(s *store.Store, cfg MCPConfig, activity *SessionActivity
 		}
 		project, _ := store.NormalizeProject(detRes.Project)
 
-		activity.RecordToolCall(defaultSessionID(project))
 		if resolvedDirectory == "" {
 			resolvedDirectory = strings.TrimSpace(detRes.Path)
 			if resolvedDirectory == "" {
@@ -1954,6 +1989,9 @@ func handleSessionStart(s *store.Store, cfg MCPConfig, activity *SessionActivity
 
 		if err := s.CreateSession(id, project, resolvedDirectory); err != nil {
 			return mcp.NewToolResultError("Failed to start session: " + err.Error()), nil
+		}
+		if activity != nil {
+			activity.RecordToolCall(id)
 		}
 
 		detRes.Project = project
@@ -1976,29 +2014,27 @@ func handleSessionEnd(s *store.Store, cfg MCPConfig, activity *SessionActivity) 
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		id, _ := req.GetArguments()["id"].(string)
 		summary, _ := req.GetArguments()["summary"].(string)
-		// project field intentionally not read — auto-detect only (REQ-308)
 
-		detRes, err := resolveWriteProject()
+		session, err := s.GetSession(id)
 		if err != nil {
-			if errors.Is(err, projectpkg.ErrInvalidConfig) {
-				return writeProjectErrorResult(nil, "", detRes, err), nil
+			if errors.Is(err, sql.ErrNoRows) {
+				return writeProjectErrorResult(nil, id, projectpkg.DetectionResult{}, &unknownSessionError{SessionID: id}), nil
 			}
-			// For session end, still complete the operation even if project resolution fails.
-			// Use basename fallback.
-			cwd, _ := os.Getwd()
-			detRes = projectpkg.DetectionResult{
-				Project: projectpkg.DetectProject(cwd),
-				Source:  "dir_basename",
-				Path:    cwd,
-			}
+			return mcp.NewToolResultError("Failed to end session: " + err.Error()), nil
 		}
-		project, _ := store.NormalizeProject(detRes.Project)
-
-		if err := s.EndSession(id, summary); err != nil {
+		project, _ := store.NormalizeProject(session.Project)
+		detRes := projectpkg.DetectionResult{Project: project, Source: projectpkg.SourceSessionProject, Path: session.Directory}
+		changed, err := s.EndSession(id, summary)
+		if err != nil {
+			if errors.Is(err, store.ErrSessionNotFound) {
+				return writeProjectErrorResult(nil, id, detRes, &unknownSessionError{SessionID: id}), nil
+			}
 			return mcp.NewToolResultError("Failed to end session: " + err.Error()), nil
 		}
 
-		activity.ClearSession(defaultSessionID(project))
+		if changed && activity != nil {
+			activity.ClearSession(id)
+		}
 
 		detRes.Project = project
 		return respondWithProject(detRes, fmt.Sprintf("Session %q completed", id), nil), nil
@@ -2010,23 +2046,27 @@ func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivi
 		content, _ := req.GetArguments()["content"].(string)
 		sessionID, _ := req.GetArguments()["session_id"].(string)
 		source, _ := req.GetArguments()["source"].(string)
-		// project field intentionally not read — auto-detect only (REQ-308)
+		projectChoice, _ := req.GetArguments()["project"].(string)
+		_, explicitProjectProvided := req.GetArguments()["project"]
 
-		detRes, err := resolveWriteProject()
+		detRes, err := resolveSaveWriteProjectWithProcessOverride(s, projectChoice, explicitProjectProvided, "", sessionID, nil, cfg.DefaultProject)
 		if err != nil {
-			return writeProjectErrorResult(nil, "", detRes, err), nil
+			return writeProjectErrorResult(activity, sessionID, detRes, err), nil
 		}
 		project, _ := store.NormalizeProject(detRes.Project)
-
-		activity.RecordToolCall(defaultSessionID(project))
 
 		if content == "" {
 			return mcp.NewToolResultError("content is required — include text with a '## Key Learnings:' section"), nil
 		}
 
-		if sessionID == "" {
-			sessionID = resolveFallbackSessionID(s, project)
-			_ = ensureImplicitSessionWithCWD(s, sessionID, project)
+		sessionID, createManual, err := resolveAttributedSessionID(s, sessionID, project)
+		if err != nil {
+			return writeProjectErrorResult(activity, sessionID, detRes, err), nil
+		}
+		if createManual {
+			if err := ensureImplicitSessionWithCWD(s, sessionID, project); err != nil {
+				return mcp.NewToolResultError("Failed to create manual session: " + err.Error()), nil
+			}
 		}
 
 		if source == "" {
@@ -2041,6 +2081,9 @@ func handleCapturePassive(s *store.Store, cfg MCPConfig, activity *SessionActivi
 		})
 		if err != nil {
 			return mcp.NewToolResultError("Passive capture failed: " + err.Error()), nil
+		}
+		if activity != nil {
+			activity.RecordToolCall(sessionID)
 		}
 
 		detRes.Project = project
@@ -2298,6 +2341,25 @@ func (e *unknownSessionError) Error() string {
 	return "unknown session: " + e.SessionID
 }
 
+type ambiguousSessionError struct {
+	Project    string
+	Candidates []string
+}
+
+func (e *ambiguousSessionError) Error() string {
+	return fmt.Sprintf("multiple active runtime sessions for project %q", e.Project)
+}
+
+type sessionResolutionError struct {
+	Err error
+}
+
+func (e *sessionResolutionError) Error() string {
+	return "session resolution failed: " + e.Err.Error()
+}
+
+func (e *sessionResolutionError) Unwrap() error { return e.Err }
+
 type sessionProjectMismatchError struct {
 	SessionID       string
 	SessionProject  string
@@ -2429,7 +2491,10 @@ func resolveSaveWriteProject(s *store.Store, projectChoice string, explicitProje
 	if trimmedSessionID != "" {
 		sess, err := s.GetSession(trimmedSessionID)
 		if err != nil {
-			return projectpkg.DetectionResult{}, &unknownSessionError{SessionID: trimmedSessionID}
+			if errors.Is(err, sql.ErrNoRows) {
+				return projectpkg.DetectionResult{}, &unknownSessionError{SessionID: trimmedSessionID}
+			}
+			return projectpkg.DetectionResult{}, &sessionResolutionError{Err: err}
 		}
 		sessionProject, err = normalizeExplicitWriteProject(sess.Project)
 		if err != nil {
@@ -2859,6 +2924,19 @@ func writeProjectErrorResult(activity *SessionActivity, sessionID string, res pr
 			res.AvailableProjects,
 		)
 	}
+	var ambiguousSessionErr *ambiguousSessionError
+	if errors.As(err, &ambiguousSessionErr) {
+		result := errorWithMeta("ambiguous_session",
+			fmt.Sprintf("Project %q has multiple active runtime sessions; provide an authoritative session_id", ambiguousSessionErr.Project),
+			res.AvailableProjects,
+		)
+		addErrorMetadata(result, map[string]any{"active_session_ids": ambiguousSessionErr.Candidates})
+		return result
+	}
+	var resolutionErr *sessionResolutionError
+	if errors.As(err, &resolutionErr) {
+		return errorWithMeta("session_resolution_failed", resolutionErr.Error(), res.AvailableProjects)
+	}
 	var unknownProjectErr *unknownProjectError
 	if errors.As(err, &unknownProjectErr) {
 		return errorWithMeta("unknown_project",
@@ -2933,6 +3011,10 @@ func errorWithMeta(code, msg string, availableProjects []string) *mcp.CallToolRe
 		envelope["hint"] = "Use a non-empty project name, not a path."
 	case "unknown_session":
 		envelope["hint"] = "Start the session first, omit session_id, or retry with an existing session_id."
+	case "ambiguous_session":
+		envelope["hint"] = "Pass the authoritative runtime session_id; Engram will not guess ownership among active sessions."
+	case "session_resolution_failed":
+		envelope["hint"] = "Retry after the local store is available; Engram did not fall back to a manual session."
 	case "session_project_mismatch":
 		envelope["hint"] = "Use a project that matches the existing session, or omit session_id and write to a different project."
 	}
@@ -2959,25 +3041,39 @@ func defaultSessionID(project string) string {
 	return "manual-save-" + project
 }
 
-// resolveFallbackSessionID resolves the session a write should attach to when
-// the caller did not provide an explicit session_id.
-//
-// It first consults the persisted sessions table for the most recent active
-// (un-ended) session of the project (issue #386). The SessionStart hook
-// registers a UUID session via the HTTP server, a SEPARATE process from this
-// MCP (stdio) server; the two share only the SQLite store, so the active
-// session must be resolved from disk rather than from any in-process map.
-//
-// When no active session exists for the project (or the store query fails for
-// any reason), it falls back to the manual-save-{project} session, preserving
-// the prior behavior for projects with no live session.
-func resolveFallbackSessionID(s *store.Store, project string) string {
-	if s != nil {
-		if id, ok, err := s.MostRecentActiveSession(project); err == nil && ok {
-			return id
+func resolveAttributedSessionID(s *store.Store, requestedID, project string) (id string, createManual bool, err error) {
+	requestedID = strings.TrimSpace(requestedID)
+	if requestedID != "" {
+		session, err := s.GetSession(requestedID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", false, &unknownSessionError{SessionID: requestedID}
+			}
+			return "", false, &sessionResolutionError{Err: err}
 		}
+		sessionProject, _ := store.NormalizeProject(session.Project)
+		if sessionProject != project {
+			return "", false, &sessionProjectMismatchError{
+				SessionID:       requestedID,
+				SessionProject:  sessionProject,
+				ExplicitProject: project,
+			}
+		}
+		return requestedID, false, nil
 	}
-	return defaultSessionID(project)
+
+	candidates, err := s.ActiveRuntimeSessions(project)
+	if err != nil {
+		return "", false, &sessionResolutionError{Err: err}
+	}
+	switch len(candidates) {
+	case 0:
+		return defaultSessionID(project), true, nil
+	case 1:
+		return candidates[0], false, nil
+	default:
+		return "", false, &ambiguousSessionError{Project: project, Candidates: candidates}
+	}
 }
 
 func intArg(req mcp.CallToolRequest, key string, defaultVal int) int {

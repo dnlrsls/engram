@@ -455,50 +455,6 @@ func TestHandleSaveFallsBackToManualSaveWhenNoActiveSession(t *testing.T) {
 	}
 }
 
-// TestHandleSaveResolvesMostRecentActiveSession covers the multi-session edge
-// case: two un-ended sessions exist; mem_save must attach to the most recent.
-func TestHandleSaveResolvesMostRecentActiveSession(t *testing.T) {
-	s := newMCPTestStore(t)
-
-	if err := s.CreateSession("uuid-older", "engram", "/work/engram"); err != nil {
-		t.Fatalf("create older session: %v", err)
-	}
-	if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, "2025-01-01 00:00:00", "uuid-older"); err != nil {
-		t.Fatalf("backdate older session: %v", err)
-	}
-	if err := s.CreateSession("uuid-newer", "engram", "/work/engram"); err != nil {
-		t.Fatalf("create newer session: %v", err)
-	}
-	if _, err := s.DB().Exec(`UPDATE sessions SET started_at = ? WHERE id = ?`, "2025-06-01 00:00:00", "uuid-newer"); err != nil {
-		t.Fatalf("set newer session started_at: %v", err)
-	}
-
-	h := handleSave(s, MCPConfig{}, NewSessionActivity(10*time.Minute))
-	res, err := h(context.Background(), mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
-		"title":   "Most recent active session",
-		"content": "**What**: saved with two active sessions\n**Why**: multi-session edge case",
-		"type":    "bugfix",
-		"project": "engram",
-	}}})
-	if err != nil {
-		t.Fatalf("handler error: %v", err)
-	}
-	if res.IsError {
-		t.Fatalf("unexpected save error: %s", callResultText(t, res))
-	}
-
-	obs, err := s.RecentObservations("engram", "project", 5)
-	if err != nil {
-		t.Fatalf("recent observations: %v", err)
-	}
-	if len(obs) == 0 {
-		t.Fatalf("expected at least one observation, got none")
-	}
-	if obs[0].SessionID != "uuid-newer" {
-		t.Fatalf("expected most recent active session uuid-newer, got %q", obs[0].SessionID)
-	}
-}
-
 func TestHandleSaveWithNilActivityStillSucceeds(t *testing.T) {
 	s := newMCPTestStore(t)
 	h := handleSave(s, MCPConfig{}, nil)
@@ -1534,7 +1490,7 @@ func TestHandleTimelineBeforeSectionAndSummaryBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add third observation: %v", err)
 	}
-	if err := s.EndSession("s-timeline", "timeline summary"); err != nil {
+	if _, err := s.EndSession("s-timeline", "timeline summary"); err != nil {
 		t.Fatalf("end session: %v", err)
 	}
 
@@ -3145,8 +3101,7 @@ func TestSessionSummaryResponseIncludesActivityScore(t *testing.T) {
 	activity := NewSessionActivity(10 * time.Minute)
 	activity.now = func() time.Time { return now }
 
-	// Use defaultSessionID of the auto-detected project so session summary
-	// looks up activity via defaultSessionID(project).
+	// With no runtime session, the final authoritative ID is the manual bucket.
 	project := "activity-score-project"
 	sessionID := defaultSessionID(project)
 
@@ -3175,8 +3130,8 @@ func TestSessionSummaryResponseIncludesActivityScore(t *testing.T) {
 	if !strings.Contains(text, "12 tool calls") {
 		t.Fatalf("expected 12 tool calls in score, got: %q", text)
 	}
-	if !strings.Contains(text, "2 saves") {
-		t.Fatalf("expected 2 saves in score, got: %q", text)
+	if !strings.Contains(text, "3 saves") {
+		t.Fatalf("expected the summary write to be included as the third save, got: %q", text)
 	}
 }
 
@@ -3196,7 +3151,7 @@ func TestSessionEndClearsActivity(t *testing.T) {
 
 	activity := NewSessionActivity(10 * time.Minute)
 	project := "myproject"
-	sessionID := defaultSessionID(project)
+	sessionID := "real-session-id"
 
 	// Record some activity
 	activity.RecordToolCall(sessionID)
@@ -3209,12 +3164,12 @@ func TestSessionEndClearsActivity(t *testing.T) {
 	}
 
 	// Create session in store so EndSession works
-	s.CreateSession("real-session-id", project, "")
+	s.CreateSession(sessionID, project, "")
 
 	end := handleSessionEnd(s, MCPConfig{}, activity)
 	_, err := end(context.Background(), mcppkg.CallToolRequest{
 		Params: mcppkg.CallToolParams{Arguments: map[string]any{
-			"id": "real-session-id",
+			"id": sessionID,
 		}},
 	})
 	if err != nil {
@@ -3262,7 +3217,7 @@ func TestCapturePassiveRecordsToolCall(t *testing.T) {
 	}
 }
 
-func TestSessionStartUsesDefaultSessionID(t *testing.T) {
+func TestSessionStartUsesAuthoritativeRuntimeID(t *testing.T) {
 	s := newMCPTestStore(t)
 
 	// Set up a git repo so resolveWriteProject returns a predictable name.
@@ -3276,8 +3231,6 @@ func TestSessionStartUsesDefaultSessionID(t *testing.T) {
 	t.Chdir(dir)
 
 	activity := NewSessionActivity(10 * time.Minute)
-	project := "session-start-project"
-
 	start := handleSessionStart(s, MCPConfig{}, activity)
 	_, err := start(context.Background(), mcppkg.CallToolRequest{
 		Params: mcppkg.CallToolParams{Arguments: map[string]any{
@@ -3288,17 +3241,15 @@ func TestSessionStartUsesDefaultSessionID(t *testing.T) {
 		t.Fatalf("handler error: %v", err)
 	}
 
-	// Activity should be recorded under defaultSessionID, not the real session ID
-	defaultSID := defaultSessionID(project)
-	score := activity.ActivityScore(defaultSID)
+	// Activity is recorded under the runtime ID that owns lifecycle.
+	score := activity.ActivityScore("real-unique-session-id")
 	if !strings.Contains(score, "1 tool call") {
-		t.Fatalf("expected activity under defaultSessionID, got: %q", score)
+		t.Fatalf("expected activity under runtime session ID, got: %q", score)
 	}
 
-	// The real session ID should NOT have activity
-	realScore := activity.ActivityScore("real-unique-session-id")
-	if realScore != "" {
-		t.Fatalf("expected no activity under real session ID, got: %q", realScore)
+	manualScore := activity.ActivityScore(defaultSessionID("session-start-project"))
+	if manualScore != "" {
+		t.Fatalf("expected no activity under manual session ID, got: %q", manualScore)
 	}
 }
 
