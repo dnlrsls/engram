@@ -98,6 +98,9 @@ var (
 
 	// ErrPulledSessionIdentityInvalid identifies an invalid identity after successful decoding and legacy fallback.
 	ErrPulledSessionIdentityInvalid = errors.New("pulled session identity is invalid")
+	// ErrPulledSessionDirectoryInvalid identifies a pulled or imported session that
+	// has no concrete directory and therefore cannot be admitted as cloud state.
+	ErrPulledSessionDirectoryInvalid = errors.New("pulled session directory is invalid")
 )
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -5069,6 +5072,9 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		if err := validateSessionID(sess.ID); err != nil {
 			return nil, fmt.Errorf("import session: %w", err)
 		}
+		if strings.TrimSpace(sess.Directory) == "" {
+			return nil, fmt.Errorf("import session %s: %w: directory is required", sess.ID, ErrPulledSessionDirectoryInvalid)
+		}
 		if strings.TrimSpace(sess.OwnershipMode) != "" && !validSessionOwnershipMode(sess.OwnershipMode) {
 			return nil, fmt.Errorf("import session %s: %w %q", sess.ID, ErrInvalidSessionOwnershipMode, sess.OwnershipMode)
 		}
@@ -7470,8 +7476,8 @@ func (s *Store) createSessionTx(tx *sql.Tx, id, project, directory, mode string)
 		 ON CONFLICT(id) DO UPDATE SET
 		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
 		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
-		   directory = CASE WHEN sessions.directory = '' THEN excluded.directory ELSE sessions.directory END`,
-		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END`,
+		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	return err
 }
@@ -7482,9 +7488,9 @@ func (s *Store) startSessionTx(tx *sql.Tx, id, project, directory, mode string) 
 		 ON CONFLICT(id) DO UPDATE SET
 		   project   = CASE WHEN ifnull(trim(sessions.project, ?), '') = '' THEN excluded.project ELSE sessions.project END,
 		   ownership_mode = CASE WHEN ifnull(trim(sessions.ownership_mode, ?), '') = '' THEN excluded.ownership_mode ELSE sessions.ownership_mode END,
-		   directory = CASE WHEN sessions.directory = '' THEN excluded.directory ELSE sessions.directory END
+		   directory = CASE WHEN trim(sessions.directory, ?) = '' THEN excluded.directory ELSE sessions.directory END
 		 WHERE sessions.ended_at IS NULL`,
-		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
+		id, project, mode, directory, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet,
 	)
 	if err != nil {
 		return err
@@ -8483,6 +8489,11 @@ func (s *Store) enqueueSyncMutationWithSourceTx(tx *sql.Tx, entity, entityKey, o
 	if source == "" {
 		source = SyncSourceLocal
 	}
+	if source == SyncSourceLocal && entity == SyncEntitySession && op == SyncOpUpsert {
+		if session, ok := payload.(syncSessionPayload); ok && strings.TrimSpace(session.Directory) == "" {
+			return nil
+		}
+	}
 	if op == SyncOpUpsert {
 		if err := s.clearSyncDeleteTombstoneForUpsertTx(tx, entity, entityKey); err != nil {
 			return err
@@ -8514,6 +8525,14 @@ func (s *Store) enqueueSyncMutationWithSourceTx(tx *sql.Tx, entity, entityKey, o
 		}
 		if !enrolled {
 			return nil
+		}
+	}
+	if source == SyncSourceLocal && entity == SyncEntitySession && op == SyncOpUpsert {
+		if _, err := s.execHook(tx, `DELETE FROM sync_mutations
+			WHERE target_key = ? AND entity = ? AND entity_key = ? AND op = ? AND source = ? AND project = ? AND acked_at IS NULL`,
+			DefaultSyncTargetKey, entity, entityKey, op, source, project,
+		); err != nil {
+			return err
 		}
 	}
 	if _, err := s.execHook(tx,
@@ -8803,6 +8822,9 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 		if mutation.Op == SyncOpDelete || isSessionDeletePayload(payload) {
 			return s.applySessionDeleteTx(tx, payload)
 		}
+		if err := validatePulledSessionDirectory([]byte(mutation.Payload)); err != nil {
+			return err
+		}
 		return s.applySessionPayloadTx(tx, payload)
 	case SyncEntityObservation:
 		var payload syncObservationPayload
@@ -8825,6 +8847,22 @@ func (s *Store) applyPulledMutationTx(tx *sql.Tx, mutation SyncMutation) error {
 	default:
 		return fmt.Errorf("unknown sync entity %q", mutation.Entity)
 	}
+}
+
+func validatePulledSessionDirectory(raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := decodeSyncPayload(raw, &fields); err != nil {
+		return err
+	}
+	directory, ok := fields["directory"]
+	if !ok {
+		return fmt.Errorf("%w: directory is required", ErrPulledSessionDirectoryInvalid)
+	}
+	var value string
+	if err := json.Unmarshal(directory, &value); err != nil || strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%w: directory must be non-blank", ErrPulledSessionDirectoryInvalid)
+	}
+	return nil
 }
 
 // pulledSessionDeadLetterSyncID derives the identity of a quarantined pulled
