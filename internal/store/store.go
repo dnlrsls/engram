@@ -416,6 +416,20 @@ type SyncMutationQuarantineReport struct {
 	Actions []SyncMutationQuarantineAction `json:"actions"`
 }
 
+// ForeignSyncTargetCleanupAction records one obsolete sync target removed by a
+// doctor repair. RetargetedMutations remain durable journal rows under cloud.
+type ForeignSyncTargetCleanupAction struct {
+	TargetKey           string `json:"target_key"`
+	RetargetedMutations int64  `json:"retargeted_mutations"`
+}
+
+// ForeignSyncTargetCleanupReport is the result of planning or applying closed
+// sync-target cleanup. Planning returns the same actions without mutating data.
+type ForeignSyncTargetCleanupReport struct {
+	Applied bool                             `json:"applied"`
+	Actions []ForeignSyncTargetCleanupAction `json:"actions"`
+}
+
 type PendingSyncMutationProjectCount struct {
 	Project string `json:"project"`
 	Count   int64  `json:"count"`
@@ -7533,6 +7547,99 @@ type SyncTargetState struct {
 	TargetKey        string `json:"target_key"`
 	Lifecycle        string `json:"lifecycle"`
 	UnackedMutations int    `json:"unacked_mutations"`
+}
+
+// CleanupForeignSyncTargets removes sync_state rows outside the closed target
+// set. Any journal rows directly attached to an obsolete target are retargeted
+// to cloud before its state row is deleted, preserving their payloads and
+// allowing the supported delivery queue to handle eligible work.
+func (s *Store) CleanupForeignSyncTargets(apply bool) (ForeignSyncTargetCleanupReport, error) {
+	report := ForeignSyncTargetCleanupReport{Actions: []ForeignSyncTargetCleanupAction{}}
+	err := s.withTx(func(tx *sql.Tx) error {
+		rows, err := s.queryItHook(tx, `
+			SELECT ss.target_key, COUNT(sm.seq)
+			FROM sync_state ss
+			LEFT JOIN sync_mutations sm ON sm.target_key = ss.target_key
+			WHERE ss.target_key NOT IN (?, ?, ?)
+			  AND NOT EXISTS (
+				SELECT 1 FROM sync_enrolled_projects sep
+				WHERE ss.target_key = ? || sep.project
+			  )
+			GROUP BY ss.target_key
+			ORDER BY ss.target_key ASC`,
+			DefaultSyncTargetKey, SyncInboxTargetKey, LocalChunkTargetKey, DefaultSyncTargetKey+":")
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var action ForeignSyncTargetCleanupAction
+			if err := rows.Scan(&action.TargetKey, &action.RetargetedMutations); err != nil {
+				return closeRowsWithError(rows, err)
+			}
+			report.Actions = append(report.Actions, action)
+		}
+		if err := closeRowsWithError(rows, rows.Err()); err != nil {
+			return err
+		}
+		if !apply || len(report.Actions) == 0 {
+			return nil
+		}
+
+		affectedProjects := map[string]struct{}{}
+		for _, action := range report.Actions {
+			projectRows, err := s.queryItHook(tx, `
+				SELECT DISTINCT sm.project
+				FROM sync_mutations sm
+				JOIN sync_enrolled_projects sep ON sep.project = sm.project
+				WHERE sm.target_key = ?
+				  AND sm.acked_at IS NULL
+				  AND sm.disposition = ?`, action.TargetKey, SyncMutationDispositionPending)
+			if err != nil {
+				return err
+			}
+			for projectRows.Next() {
+				var project string
+				if err := projectRows.Scan(&project); err != nil {
+					return closeRowsWithError(projectRows, err)
+				}
+				affectedProjects[project] = struct{}{}
+			}
+			if err := closeRowsWithError(projectRows, projectRows.Err()); err != nil {
+				return err
+			}
+			if _, err := s.execHook(tx, `UPDATE sync_mutations SET target_key = ?, acked_at = NULL, disposition = 'pending', disposition_reason = NULL, disposition_evidence = NULL, disposition_at = NULL WHERE target_key = ?`, DefaultSyncTargetKey, action.TargetKey); err != nil {
+				return err
+			}
+			if _, err := s.execHook(tx, `DELETE FROM sync_state WHERE target_key = ?`, action.TargetKey); err != nil {
+				return err
+			}
+		}
+		// Retargeting can surface old sequence numbers that were never reflected in
+		// cloud's delivery cursor. Recompute both monotonic cursors before its
+		// lifecycle is refreshed, matching project-target cursor semantics.
+		if _, err := s.execHook(tx, `
+			UPDATE sync_state
+			SET last_enqueued_seq = MAX(last_enqueued_seq, (SELECT ifnull(MAX(seq), 0) FROM sync_mutations WHERE target_key = ?)),
+			    last_acked_seq = MAX(last_acked_seq, (SELECT ifnull(MAX(seq), 0) FROM sync_mutations WHERE target_key = ? AND acked_at IS NOT NULL)),
+			    updated_at = datetime('now')
+			WHERE target_key = ?`, DefaultSyncTargetKey, DefaultSyncTargetKey, DefaultSyncTargetKey); err != nil {
+			return err
+		}
+		if err := s.refreshSyncLifecycleTx(tx, DefaultSyncTargetKey); err != nil {
+			return err
+		}
+		for project := range affectedProjects {
+			if err := s.refreshProjectSyncLifecycleTx(tx, project); err != nil {
+				return err
+			}
+		}
+		report.Applied = true
+		return nil
+	})
+	if err != nil {
+		return ForeignSyncTargetCleanupReport{}, fmt.Errorf("cleanup foreign sync targets: %w", err)
+	}
+	return report, nil
 }
 
 // ListSyncStates returns every sync_state row with its pending mutation count,

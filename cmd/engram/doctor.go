@@ -215,6 +215,22 @@ func cmdDoctorRepair(cfg store.Config) {
 		failDoctorRepair(err.Error())
 		return
 	}
+	if check == diagnostic.CheckSyncTargetClosedSpace {
+		cleanup, err := s.CleanupForeignSyncTargets(mode == diagnostic.RepairModeApply)
+		if err != nil {
+			failDoctorRepair(err.Error())
+			return
+		}
+		if cleanup.Applied {
+			plan.Status = "applied"
+			plan.TargetActions = make([]diagnostic.SyncTargetCleanupAction, 0, len(cleanup.Actions))
+			for _, action := range cleanup.Actions {
+				plan.TargetActions = append(plan.TargetActions, diagnostic.SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations})
+			}
+		}
+		writeDoctorRepairJSON(plan)
+		return
+	}
 	actions := make([]store.SessionProjectReclassification, 0, len(plan.Actions))
 	for _, action := range plan.Actions {
 		actions = append(actions, store.SessionProjectReclassification{SessionID: action.SessionID, FromProject: action.FromProject, ToProject: action.ToProject})
@@ -256,7 +272,8 @@ func isSupportedDoctorRepairCheck(check string) bool {
 	case diagnostic.CheckSessionProjectDirectoryMismatch,
 		diagnostic.CheckManualSessionNameProjectMismatch,
 		diagnostic.CheckInvalidSessionIdentity,
-		diagnostic.CheckSyncMutationRequiredFields:
+		diagnostic.CheckSyncMutationRequiredFields,
+		diagnostic.CheckSyncTargetClosedSpace:
 		return true
 	default:
 		return false

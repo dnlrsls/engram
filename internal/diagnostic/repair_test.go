@@ -7,6 +7,28 @@ import (
 	"github.com/Gentleman-Programming/engram/v2/internal/store"
 )
 
+func TestBuildRepairPlanForeignSyncTargetUsesDoctorEvidence(t *testing.T) {
+	s := newDiagnosticTestStore(t)
+	if _, err := s.DB().Exec(`INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES ('satellite:stale', 'idle', datetime('now'))`); err != nil {
+		t.Fatalf("seed foreign target: %v", err)
+	}
+	report, err := NewRunner().RunOne(context.Background(), Scope{Store: s}, CheckSyncTargetClosedSpace)
+	if err != nil {
+		t.Fatalf("RunOne: %v", err)
+	}
+
+	plan, err := BuildRepairPlan(context.Background(), Scope{Store: s}, report, CheckSyncTargetClosedSpace, RepairModeDryRun)
+	if err != nil {
+		t.Fatalf("BuildRepairPlan: %v", err)
+	}
+	if plan.Status != "dry_run" || len(plan.Actions) != 0 || len(plan.TargetActions) != 1 {
+		t.Fatalf("plan=%+v", plan)
+	}
+	if action := plan.TargetActions[0]; action.TargetKey != "satellite:stale" || action.UnackedMutations != 0 {
+		t.Fatalf("action=%+v", action)
+	}
+}
+
 func TestBuildRepairPlanDirectoryMismatchUsesTrustedEvidence(t *testing.T) {
 	s := newDiagnosticTestStore(t)
 	if err := s.CreateSession("s-engram", "sias-app", "/work/engram"); err != nil {

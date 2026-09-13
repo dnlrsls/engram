@@ -40,15 +40,24 @@ type RepairCounts struct {
 	PromptsApplied      int64 `json:"prompts_applied"`
 }
 
+// SyncTargetCleanupAction identifies one sync target doctor can remove without
+// deleting its journal payloads.
+type SyncTargetCleanupAction struct {
+	TargetKey           string `json:"target_key"`
+	UnackedMutations    int    `json:"unacked_mutations,omitempty"`
+	RetargetedMutations int64  `json:"retargeted_mutations,omitempty"`
+}
+
 type RepairPlan struct {
-	Project    string                    `json:"project"`
-	Check      string                    `json:"check"`
-	Mode       RepairMode                `json:"mode"`
-	Status     string                    `json:"status"`
-	Actions    []ProjectReclassifyAction `json:"actions"`
-	Skipped    []RepairSkip              `json:"skipped,omitempty"`
-	Counts     RepairCounts              `json:"counts"`
-	BackupPath string                    `json:"backup_path,omitempty"`
+	Project       string                    `json:"project"`
+	Check         string                    `json:"check"`
+	Mode          RepairMode                `json:"mode"`
+	Status        string                    `json:"status"`
+	Actions       []ProjectReclassifyAction `json:"actions"`
+	TargetActions []SyncTargetCleanupAction `json:"target_actions,omitempty"`
+	Skipped       []RepairSkip              `json:"skipped,omitempty"`
+	Counts        RepairCounts              `json:"counts"`
+	BackupPath    string                    `json:"backup_path,omitempty"`
 }
 
 func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check string, mode RepairMode) (RepairPlan, error) {
@@ -76,15 +85,40 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 		}
 	case CheckInvalidSessionIdentity:
 		planInvalidSessionIdentityRepair(&plan, report)
+	case CheckSyncTargetClosedSpace:
+		planForeignSyncTargetCleanup(&plan, report)
 	default:
 		return RepairPlan{}, fmt.Errorf("unsupported repair check %q", check)
 	}
 
 	dedupeAndSortRepairPlan(&plan)
-	if len(plan.Actions) == 0 {
+	if len(plan.Actions) == 0 && len(plan.TargetActions) == 0 {
 		plan.Status = "noop"
 	}
 	return plan, nil
+}
+
+func planForeignSyncTargetCleanup(plan *RepairPlan, report Report) {
+	for _, check := range report.Checks {
+		for _, finding := range check.Findings {
+			if finding.ReasonCode != ReasonForeignSyncTarget {
+				continue
+			}
+			var evidence struct {
+				TargetKey        string `json:"target_key"`
+				UnackedMutations int    `json:"unacked_mutations"`
+			}
+			if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
+				plan.Skipped = append(plan.Skipped, RepairSkip{ReasonCode: "invalid_doctor_evidence", Message: err.Error()})
+				continue
+			}
+			if strings.TrimSpace(evidence.TargetKey) == "" {
+				plan.Skipped = append(plan.Skipped, RepairSkip{ReasonCode: "invalid_sync_target_evidence", Message: "doctor evidence does not identify a foreign sync target"})
+				continue
+			}
+			plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupAction{TargetKey: evidence.TargetKey, UnackedMutations: evidence.UnackedMutations})
+		}
+	}
 }
 
 func planInvalidSessionIdentityRepair(plan *RepairPlan, report Report) {
@@ -199,6 +233,15 @@ func dedupeAndSortRepairPlan(plan *RepairPlan) {
 		plan.Actions = append(plan.Actions, action)
 	}
 	sort.Slice(plan.Actions, func(i, j int) bool { return plan.Actions[i].SessionID < plan.Actions[j].SessionID })
+	targets := map[string]SyncTargetCleanupAction{}
+	for _, action := range plan.TargetActions {
+		targets[action.TargetKey] = action
+	}
+	plan.TargetActions = plan.TargetActions[:0]
+	for _, action := range targets {
+		plan.TargetActions = append(plan.TargetActions, action)
+	}
+	sort.Slice(plan.TargetActions, func(i, j int) bool { return plan.TargetActions[i].TargetKey < plan.TargetActions[j].TargetKey })
 	sort.Slice(plan.Skipped, func(i, j int) bool {
 		if plan.Skipped[i].SessionID == plan.Skipped[j].SessionID {
 			return plan.Skipped[i].ReasonCode < plan.Skipped[j].ReasonCode
