@@ -734,6 +734,7 @@ let runtimeSessionIdentityAmbiguous = false;
 
 const knownSessions = new Set<string>();
 const sessionRegistrationsInFlight = new Map<string, Promise<void>>();
+const sessionEndingsInFlight = new Map<string, Promise<unknown>>();
 const toolCounts = new Map<string, number>();
 
 async function ensureSession(sessionId: string, sessionProject = project, fetch: EngramFetcher = engramFetch): Promise<void> {
@@ -814,10 +815,43 @@ async function refreshProjectDetection(cwd: string, fetch: EngramFetcher = engra
   applyDetectedProject(await detectServerProject(cwd, fetch, signal));
 }
 
+function hasKnownSession(sessionId: string): boolean {
+  return [...knownSessions].some((key) => key.endsWith(`:${sessionId}`));
+}
+
 function forgetKnownSession(sessionId: string): void {
   knownSessions.delete(sessionId);
   for (const key of knownSessions) {
     if (key.endsWith(`:${sessionId}`)) knownSessions.delete(key);
+  }
+}
+
+function hasSessionRegistrationInFlight(sessionId: string): boolean {
+  return [...sessionRegistrationsInFlight.keys()].some((key) => key.endsWith(`:${sessionId}`));
+}
+
+async function waitForSessionRegistration(sessionId: string): Promise<void> {
+  const registrations = [...sessionRegistrationsInFlight.entries()]
+    .filter(([key]) => key.endsWith(`:${sessionId}`))
+    .map(([, registration]) => registration.catch(() => undefined));
+  await Promise.all(registrations);
+}
+
+async function endRegisteredSessionOnce(sessionId: string, end: () => Promise<unknown>): Promise<unknown> {
+  const existing = sessionEndingsInFlight.get(sessionId);
+  if (existing) return existing;
+
+  const ending = (async () => {
+    await waitForSessionRegistration(sessionId);
+    if (!hasKnownSession(sessionId)) return null;
+    forgetKnownSession(sessionId);
+    return end();
+  })();
+  sessionEndingsInFlight.set(sessionId, ending);
+  try {
+    return await ending;
+  } finally {
+    if (sessionEndingsInFlight.get(sessionId) === ending) sessionEndingsInFlight.delete(sessionId);
   }
 }
 
@@ -1176,11 +1210,18 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
         method: "POST",
         body: { id: params.id, project, directory: params.directory || directory || ctx.cwd },
       });
-    case "mem_session_end":
-      return fetch(`/sessions/${encodeURIComponent(String(params.id))}/end`, {
+    case "mem_session_end": {
+      const endedSessionID = String(params.id);
+      const pendingEnd = sessionEndingsInFlight.get(endedSessionID);
+      if (pendingEnd) return pendingEnd;
+      const end = () => fetch(`/sessions/${encodeURIComponent(endedSessionID)}/end`, {
         method: "POST",
         body: { summary: params.summary || "" },
       });
+      return endedSessionID === sessionId && (hasKnownSession(endedSessionID) || hasSessionRegistrationInFlight(endedSessionID))
+        ? endRegisteredSessionOnce(endedSessionID, end)
+        : end();
+    }
     case "mem_current_project": {
       const cwd = String(params.cwd || ctx.cwd);
       try {
@@ -1275,6 +1316,7 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
     const data = await awaitWithAbort(callMemoryTool(toolName, params, ctx, transport.fetch), signal);
     const timedOutMethod = transport.timedOutMethod();
     if (timedOutMethod) throw new Error(unreachableMessage(timedOutMethod));
+
     const result = { content: [{ type: "text" as const, text: textResult(data, toolName) }], details: { data } };
     if (toolName === "mem_doctor" && data && typeof data === "object" && "status" in data && data.status === "error") {
       const errorResult = { ...result, isError: true };
@@ -1331,6 +1373,14 @@ export default function registerEngram(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event: unknown, ctx: SessionContext) => {
     const sessionId = observeRuntimeSessionID(ctx);
     if (!sessionId) return;
+    try {
+      await endRegisteredSessionOnce(sessionId, () => bestEffortEngramFetch(
+        `/sessions/${encodeURIComponent(sessionId)}/end`,
+        { method: "POST", body: { summary: "" } },
+      ));
+    } catch (error) {
+      warnEngramFailure(`/sessions/${encodeURIComponent(sessionId)}/end`, error);
+    }
     toolCounts.delete(sessionId);
     forgetKnownSession(sessionId);
     forgetSelfHealContext(sessionId);
