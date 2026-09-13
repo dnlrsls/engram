@@ -24,7 +24,7 @@ func TestBuildRepairPlanForeignSyncTargetUsesDoctorEvidence(t *testing.T) {
 	if plan.Status != "dry_run" || len(plan.Actions) != 0 || len(plan.TargetActions) != 1 {
 		t.Fatalf("plan=%+v", plan)
 	}
-	if action := plan.TargetActions[0]; action.TargetKey != "satellite:stale" || action.UnackedMutations != 0 {
+	if action := plan.TargetActions[0]; action.TargetKey != "satellite:stale" || action.RetargetedMutations != 0 {
 		t.Fatalf("action=%+v", action)
 	}
 }

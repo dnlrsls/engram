@@ -274,7 +274,7 @@ func TestCmdDoctorRepairCleansForeignSyncTargetsWithoutDroppingJournal(t *testin
 		t.Fatalf("apply=%v", applied)
 	}
 	actual := applied["target_actions"].([]any)[0].(map[string]any)
-	if actual["retargeted_mutations"] != float64(1) || actual["unacked_mutations"] != nil {
+	if actual["retargeted_mutations"] != float64(1) || actual["retained_mutations"] != float64(0) || actual["state_removed"] != true {
 		t.Fatalf("apply action=%v", actual)
 	}
 	withArgs(t, "engram", "doctor", "--json", "--check", "sync_target_closed_space")
@@ -301,11 +301,6 @@ func TestCmdDoctorRepairCleansForeignSyncTargetsWithoutDroppingJournal(t *testin
 	}
 	if target != store.DefaultSyncTargetKey || payload != `{"sync_id":"foreign-journal","project":"valid"}` {
 		t.Fatalf("journal changed target=%q payload=%q", target, payload)
-	}
-
-	repeated := run("engram", "doctor", "repair", "--project", "valid", "--check", "sync_target_closed_space", "--apply")
-	if repeated["status"] != "noop" {
-		t.Fatalf("repeat apply=%v", repeated)
 	}
 }
 

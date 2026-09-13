@@ -221,11 +221,17 @@ func cmdDoctorRepair(cfg store.Config) {
 			failDoctorRepair(err.Error())
 			return
 		}
-		if cleanup.Applied {
+		plan.TargetActions = make([]diagnostic.SyncTargetCleanupAction, 0, len(cleanup.Actions))
+		if mode == diagnostic.RepairModeApply && len(cleanup.Actions) > 0 {
 			plan.Status = "applied"
-			plan.TargetActions = make([]diagnostic.SyncTargetCleanupAction, 0, len(cleanup.Actions))
-			for _, action := range cleanup.Actions {
-				plan.TargetActions = append(plan.TargetActions, diagnostic.SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations})
+		}
+		for _, action := range cleanup.Actions {
+			plan.TargetActions = append(plan.TargetActions, diagnostic.SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved})
+			if action.RetainedMutations > 0 && mode == diagnostic.RepairModeApply {
+				plan.Status = "blocked"
+				if cleanup.Applied {
+					plan.Status = "partial"
+				}
 			}
 		}
 		writeDoctorRepairJSON(plan)

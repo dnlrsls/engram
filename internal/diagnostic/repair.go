@@ -44,8 +44,9 @@ type RepairCounts struct {
 // deleting its journal payloads.
 type SyncTargetCleanupAction struct {
 	TargetKey           string `json:"target_key"`
-	UnackedMutations    int    `json:"unacked_mutations,omitempty"`
-	RetargetedMutations int64  `json:"retargeted_mutations,omitempty"`
+	RetargetedMutations int64  `json:"retargeted_mutations"`
+	RetainedMutations   int64  `json:"retained_mutations"`
+	StateRemoved        bool   `json:"state_removed"`
 }
 
 type RepairPlan struct {
@@ -116,7 +117,7 @@ func planForeignSyncTargetCleanup(plan *RepairPlan, report Report) {
 				plan.Skipped = append(plan.Skipped, RepairSkip{ReasonCode: "invalid_sync_target_evidence", Message: "doctor evidence does not identify a foreign sync target"})
 				continue
 			}
-			plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupAction{TargetKey: evidence.TargetKey, UnackedMutations: evidence.UnackedMutations})
+			plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupAction{TargetKey: evidence.TargetKey, RetargetedMutations: int64(evidence.UnackedMutations)})
 		}
 	}
 }
