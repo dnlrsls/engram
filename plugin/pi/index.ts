@@ -841,9 +841,10 @@ async function endRegisteredSessionOnce(sessionId: string, end: () => Promise<un
   const existing = sessionEndingsInFlight.get(sessionId);
   if (existing) return existing;
 
+  const registrationWasInFlight = hasSessionRegistrationInFlight(sessionId);
   const ending = (async () => {
     await waitForSessionRegistration(sessionId);
-    if (!hasKnownSession(sessionId)) return null;
+    if (!registrationWasInFlight && !hasKnownSession(sessionId)) return null;
     forgetKnownSession(sessionId);
     return end();
   })();

@@ -774,6 +774,39 @@ test("Pi session shutdown serializes end delivery and waits for registration", a
       await Promise.all([write, shutdown]);
       assert.deepEqual(raceEndCalls, [{ method: "POST", body: { summary: "" } }], "shutdown must end a registration that was already in flight");
     });
+
+    const uncertainRegistration = deferred();
+    const uncertainRegistrationStarted = deferred();
+    const uncertainEndCalls = [];
+    globalThis.fetch = async (url, init = {}) => {
+      const path = new URL(url).pathname;
+      if (path === "/health") return new Response(JSON.stringify({ status: "ok" }));
+      if (path === "/project/current") return new Response(JSON.stringify({ project: "pi" }));
+      if (path === "/sessions") {
+        uncertainRegistrationStarted.resolve();
+        await uncertainRegistration.promise;
+        const timeout = new Error("registration timed out");
+        timeout.name = "TimeoutError";
+        throw timeout;
+      }
+      if (path.endsWith("/end")) {
+        uncertainEndCalls.push({ method: init.method ?? "GET", body: JSON.parse(init.body) });
+        return new Response(JSON.stringify({ status: "ended" }));
+      }
+      throw new Error(`unexpected request: ${path}`);
+    };
+    await withPluginSandbox("engram-pi-contract-", async ({ sandbox }) => {
+      const { registeredTools } = await loadPluginHarness(sandbox);
+      const ctx = runtimeContext("uncertain-registration-session");
+      const write = registeredTools.get("mem_save").execute("register-uncertain", { title: "one", content: "one" }, undefined, undefined, ctx);
+      await uncertainRegistrationStarted.promise;
+      const explicitEnd = registeredTools.get("mem_session_end").execute("end-uncertain", { id: "uncertain-registration-session" }, undefined, undefined, ctx);
+      uncertainRegistration.resolve();
+      const [writeResult, endResult] = await Promise.all([write, explicitEnd]);
+      assert.equal(writeResult.isError, true, "the registration outcome is uncertain");
+      assert.equal(endResult.isError, undefined, "explicit end must still attempt delivery");
+      assert.deepEqual(uncertainEndCalls, [{ method: "POST", body: { summary: "" } }]);
+    });
   } finally {
     globalThis.fetch = originalFetch;
     if (originalUrl === undefined) delete process.env.ENGRAM_URL;
