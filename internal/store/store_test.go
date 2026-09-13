@@ -7104,7 +7104,11 @@ func TestLocalSessionUpsertsCoalescePendingState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list session mutations: %v", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close session mutation rows: %v", err)
+		}
+	}()
 	var localUpsertSeq, deleteSeq int64
 	seen := map[string]int{}
 	for rows.Next() {
