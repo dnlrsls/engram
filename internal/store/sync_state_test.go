@@ -34,7 +34,7 @@ func TestCleanupForeignSyncTargetsPreservesJournalAndValidTargets(t *testing.T) 
 	if err != nil {
 		t.Fatalf("seed pending mutation: %v", err)
 	}
-	if _, err := s.DB().Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, acked_at, disposition, disposition_reason, disposition_evidence, disposition_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), 'quarantined', 'kept_reason', 'kept_evidence', datetime('now'))`, "satellite:pending", SyncEntityObservation, "preserved-metadata", SyncOpUpsert, `{}`, SyncSourceLocal, "valid"); err != nil {
+	if _, err := s.DB().Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, acked_at, disposition, disposition_reason, disposition_evidence, disposition_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), 'quarantined', 'kept_reason', 'kept_evidence', datetime('now')), (?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, NULL)`, "satellite:pending", SyncEntityObservation, "preserved-metadata", SyncOpUpsert, `{}`, SyncSourceLocal, "valid", "satellite:pending", SyncEntityObservation, "local-only", SyncOpUpsert, `{"sync_id":"local-only","project":"local-only"}`, SyncSourceLocal, "local-only"); err != nil {
 		t.Fatalf("seed metadata mutation: %v", err)
 	}
 	pendingSeq, err := pendingResult.LastInsertId()
@@ -44,7 +44,7 @@ func TestCleanupForeignSyncTargetsPreservesJournalAndValidTargets(t *testing.T) 
 	if _, err := s.DB().Exec(`CREATE TRIGGER abort_foreign_cleanup BEFORE UPDATE ON sync_mutations WHEN NEW.target_key = 'cloud' BEGIN SELECT RAISE(ABORT, 'forced cleanup failure'); END`); err != nil {
 		t.Fatalf("create rollback trigger: %v", err)
 	}
-	if _, err := s.CleanupForeignSyncTargets(true); err == nil || scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key LIKE 'satellite:%'`) != 2 || scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations WHERE target_key = 'satellite:pending'`) != 2 {
+	if _, err := s.CleanupForeignSyncTargets(true); err == nil || scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key LIKE 'satellite:%'`) != 2 || scalarInt(t, s, `SELECT COUNT(*) FROM sync_mutations WHERE target_key = 'satellite:pending'`) != 3 {
 		t.Fatal("failed cleanup persisted a partial change")
 	}
 	if _, err := s.DB().Exec(`DROP TRIGGER abort_foreign_cleanup`); err != nil {
@@ -55,7 +55,7 @@ func TestCleanupForeignSyncTargetsPreservesJournalAndValidTargets(t *testing.T) 
 	if err != nil {
 		t.Fatalf("plan cleanup: %v", err)
 	}
-	if planned.Applied || len(planned.Actions) != 2 {
+	if planned.Applied || len(planned.Actions) != 2 || planned.Actions[1].RetargetedMutations != 1 || planned.Actions[1].RetainedMutations != 2 {
 		t.Fatalf("plan=%+v", planned)
 	}
 	if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key LIKE 'satellite:%'`); got != 2 {
@@ -66,21 +66,21 @@ func TestCleanupForeignSyncTargetsPreservesJournalAndValidTargets(t *testing.T) 
 	if err != nil {
 		t.Fatalf("apply cleanup: %v", err)
 	}
-	if !applied.Applied || len(applied.Actions) != 2 || applied.Actions[1].RetargetedMutations != 1 || applied.Actions[1].RetainedMutations != 1 || applied.Actions[1].StateRemoved {
+	if !applied.Applied || len(applied.Actions) != 2 || applied.Actions[1].RetargetedMutations != 1 || applied.Actions[1].RetainedMutations != 2 || applied.Actions[1].StateRemoved {
 		t.Fatalf("applied=%+v", applied)
 	}
 	if got := scalarInt(t, s, `SELECT COUNT(*) FROM sync_state WHERE target_key LIKE 'satellite:%'`); got != 1 {
 		t.Fatalf("foreign targets after mixed cleanup: %d", got)
 	}
-	var target, payload string
-	if err := s.DB().QueryRow(`SELECT target_key, payload FROM sync_mutations WHERE entity_key = 'preserved-mutation'`).Scan(&target, &payload); err != nil {
+	var target, payload, localTarget string
+	if err := s.DB().QueryRow(`SELECT target_key, payload, (SELECT target_key FROM sync_mutations WHERE entity_key = 'local-only') FROM sync_mutations WHERE entity_key = 'preserved-mutation'`).Scan(&target, &payload, &localTarget); err != nil {
 		t.Fatalf("read preserved mutation: %v", err)
 	}
-	if target != DefaultSyncTargetKey || payload != `{"sync_id":"preserved-mutation","project":"valid"}` {
-		t.Fatalf("preserved mutation target=%q payload=%q", target, payload)
+	if target != DefaultSyncTargetKey || payload != `{"sync_id":"preserved-mutation","project":"valid"}` || localTarget != "satellite:pending" {
+		t.Fatalf("mutation targets=%q,%q payload=%q", target, localTarget, payload)
 	}
 	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
-	if err != nil || len(pending) == 0 || pending[len(pending)-1].Seq != pendingSeq {
+	if err != nil || len(pending) != 3 || pending[len(pending)-1].Seq != pendingSeq {
 		t.Fatalf("retargeted mutation is not queued: %+v, %v", pending, err)
 	}
 	cloud, err := s.GetSyncState(DefaultSyncTargetKey)
@@ -104,7 +104,7 @@ func TestCleanupForeignSyncTargetsPreservesJournalAndValidTargets(t *testing.T) 
 	if err != nil {
 		t.Fatalf("repeat cleanup: %v", err)
 	}
-	if repeated.Applied || len(repeated.Actions) != 1 || repeated.Actions[0].RetargetedMutations != 0 || repeated.Actions[0].RetainedMutations != 1 || repeated.Actions[0].StateRemoved {
+	if repeated.Applied || len(repeated.Actions) != 1 || repeated.Actions[0].RetargetedMutations != 0 || repeated.Actions[0].RetainedMutations != 2 || repeated.Actions[0].StateRemoved {
 		t.Fatalf("repeat cleanup=%+v", repeated)
 	}
 }

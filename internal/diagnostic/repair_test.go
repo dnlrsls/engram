@@ -10,8 +10,8 @@ import (
 func TestBuildRepairPlanForeignSyncTargetUsesStoreClassification(t *testing.T) {
 	s := newDiagnosticTestStore(t)
 	if _, err := s.DB().Exec(`
-		INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES ('satellite:empty', 'idle', datetime('now')), ('satellite:terminal', 'idle', datetime('now'));
-		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, disposition) VALUES ('satellite:terminal', 'observation', 'pending', 'upsert', '{}', 'local', 'pending');
+		INSERT INTO sync_enrolled_projects (project) VALUES ('valid'); INSERT INTO sync_state (target_key, lifecycle, updated_at) VALUES ('satellite:empty', 'idle', datetime('now')), ('satellite:terminal', 'idle', datetime('now'));
+		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project, disposition) VALUES ('satellite:terminal', 'observation', 'pending', 'upsert', '{}', 'local', 'valid', 'pending');
 		INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, acked_at, disposition, disposition_reason, disposition_evidence, disposition_at) VALUES ('satellite:terminal', 'observation', 'terminal', 'upsert', '{}', 'local', datetime('now'), 'quarantined', 'kept', 'evidence', datetime('now'));`); err != nil {
 		t.Fatalf("seed foreign targets: %v", err)
 	}

@@ -7557,8 +7557,8 @@ func (s *Store) CleanupForeignSyncTargets(apply bool) (ForeignSyncTargetCleanupR
 	err := s.withTx(func(tx *sql.Tx) error {
 		rows, err := s.queryItHook(tx, `
 			SELECT ss.target_key,
-				SUM(CASE WHEN sm.acked_at IS NULL AND sm.disposition = 'pending' THEN 1 ELSE 0 END),
-				COUNT(sm.seq) - SUM(CASE WHEN sm.acked_at IS NULL AND sm.disposition = 'pending' THEN 1 ELSE 0 END)
+				SUM(CASE WHEN sm.acked_at IS NULL AND sm.disposition = 'pending' AND EXISTS(SELECT 1 FROM sync_enrolled_projects sep WHERE sep.project = sm.project) THEN 1 ELSE 0 END),
+				COUNT(sm.seq) - SUM(CASE WHEN sm.acked_at IS NULL AND sm.disposition = 'pending' AND EXISTS(SELECT 1 FROM sync_enrolled_projects sep WHERE sep.project = sm.project) THEN 1 ELSE 0 END)
 			FROM sync_state ss
 			LEFT JOIN sync_mutations sm ON sm.target_key = ss.target_key
 			WHERE ss.target_key NOT IN (?, ?, ?)
@@ -7605,7 +7605,7 @@ func (s *Store) CleanupForeignSyncTargets(apply bool) (ForeignSyncTargetCleanupR
 				if err := closeRowsWithError(projectRows, projectRows.Err()); err != nil {
 					return err
 				}
-				if _, err := s.execHook(tx, `UPDATE sync_mutations SET target_key = ? WHERE target_key = ? AND acked_at IS NULL AND disposition = ?`, DefaultSyncTargetKey, action.TargetKey, SyncMutationDispositionPending); err != nil {
+				if _, err := s.execHook(tx, `UPDATE sync_mutations SET target_key = ? WHERE target_key = ? AND acked_at IS NULL AND disposition = ? AND EXISTS(SELECT 1 FROM sync_enrolled_projects sep WHERE sep.project = sync_mutations.project)`, DefaultSyncTargetKey, action.TargetKey, SyncMutationDispositionPending); err != nil {
 					return err
 				}
 				movedAny = true
