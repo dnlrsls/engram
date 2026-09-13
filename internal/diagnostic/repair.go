@@ -87,7 +87,9 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 	case CheckInvalidSessionIdentity:
 		planInvalidSessionIdentityRepair(&plan, report)
 	case CheckSyncTargetClosedSpace:
-		planForeignSyncTargetCleanup(&plan, report)
+		if err := planForeignSyncTargetCleanup(&plan, scope); err != nil {
+			return RepairPlan{}, err
+		}
 	default:
 		return RepairPlan{}, fmt.Errorf("unsupported repair check %q", check)
 	}
@@ -99,27 +101,15 @@ func BuildRepairPlan(ctx context.Context, scope Scope, report Report, check stri
 	return plan, nil
 }
 
-func planForeignSyncTargetCleanup(plan *RepairPlan, report Report) {
-	for _, check := range report.Checks {
-		for _, finding := range check.Findings {
-			if finding.ReasonCode != ReasonForeignSyncTarget {
-				continue
-			}
-			var evidence struct {
-				TargetKey        string `json:"target_key"`
-				UnackedMutations int    `json:"unacked_mutations"`
-			}
-			if err := json.Unmarshal(finding.Evidence, &evidence); err != nil {
-				plan.Skipped = append(plan.Skipped, RepairSkip{ReasonCode: "invalid_doctor_evidence", Message: err.Error()})
-				continue
-			}
-			if strings.TrimSpace(evidence.TargetKey) == "" {
-				plan.Skipped = append(plan.Skipped, RepairSkip{ReasonCode: "invalid_sync_target_evidence", Message: "doctor evidence does not identify a foreign sync target"})
-				continue
-			}
-			plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupAction{TargetKey: evidence.TargetKey, RetargetedMutations: int64(evidence.UnackedMutations)})
-		}
+func planForeignSyncTargetCleanup(plan *RepairPlan, scope Scope) error {
+	cleanup, err := scope.Store.CleanupForeignSyncTargets(false)
+	if err != nil {
+		return err
 	}
+	for _, action := range cleanup.Actions {
+		plan.TargetActions = append(plan.TargetActions, SyncTargetCleanupAction{TargetKey: action.TargetKey, RetargetedMutations: action.RetargetedMutations, RetainedMutations: action.RetainedMutations, StateRemoved: action.StateRemoved})
+	}
+	return nil
 }
 
 func planInvalidSessionIdentityRepair(plan *RepairPlan, report Report) {
