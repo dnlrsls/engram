@@ -287,7 +287,11 @@ func TestCmdDoctorRepairCleansForeignSyncTargetsWithoutDroppingJournal(t *testin
 	if err != nil {
 		t.Fatalf("reopen store: %v", err)
 	}
-	defer reopened.Close()
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened store: %v", err)
+		}
+	})
 	if _, err := reopened.GetObservation(observationID); err != nil {
 		t.Fatalf("cleanup removed observation: %v", err)
 	}
