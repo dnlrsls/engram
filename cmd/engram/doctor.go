@@ -92,6 +92,7 @@ func printDoctorUsage() {
 	fmt.Fprintln(os.Stdout, "usage: engram doctor [--json] [--project PROJECT] [--check CODE]")
 	fmt.Fprintln(os.Stdout, "       engram doctor repair --project PROJECT --check CODE (--plan|--dry-run|--apply)")
 	fmt.Fprintln(os.Stdout, "       engram doctor repair [--project PROJECT] --check "+diagnostic.CheckSyncMutationRequiredFields+" [--plan|--dry-run|--apply] (default: --dry-run)")
+	fmt.Fprintln(os.Stdout, "       engram doctor repair --project PROJECT --check invalid_session_identity --replacement-id ID [--source-id SOURCE] (--plan|--dry-run|--apply)")
 	_, _ = fmt.Fprintln(os.Stdout, "note: --project is required for every repair check except "+diagnostic.CheckSyncMutationRequiredFields+", where it optionally scopes title repair, supersession, quarantine, and source-title repair.")
 	fmt.Fprintln(os.Stdout, "checks: "+strings.Join(diagnostic.RegisteredCodes(), ", "))
 	_, _ = fmt.Fprintln(os.Stdout, "diagnostic-only checks with no repair: "+strings.Join(diagnosticOnlyCheckCodes(), ", "))
@@ -100,6 +101,7 @@ func printDoctorUsage() {
 func printDoctorRepairUsage() {
 	_, _ = fmt.Fprintln(os.Stdout, "usage: engram doctor repair --project PROJECT --check CODE (--plan|--dry-run|--apply)")
 	_, _ = fmt.Fprintln(os.Stdout, "       engram doctor repair [--project PROJECT] --check "+diagnostic.CheckSyncMutationRequiredFields+" [--plan|--dry-run|--apply] (default: --dry-run)")
+	_, _ = fmt.Fprintln(os.Stdout, "       engram doctor repair --project PROJECT --check invalid_session_identity --replacement-id ID [--source-id SOURCE] (--plan|--dry-run|--apply)")
 	_, _ = fmt.Fprintln(os.Stdout, "note: --project is required for every repair check except "+diagnostic.CheckSyncMutationRequiredFields+", where it optionally scopes title repair, supersession, quarantine, and source-title repair.")
 	_, _ = fmt.Fprintln(os.Stdout, "repairable checks: "+strings.Join(diagnostic.RepairableCodes(), ", "))
 	_, _ = fmt.Fprintln(os.Stdout, "diagnostic-only checks with no repair: "+strings.Join(diagnosticOnlyCheckCodes(), ", "))
@@ -126,8 +128,27 @@ func cmdDoctorRepair(cfg store.Config) {
 	check := ""
 	mode := diagnostic.RepairMode("")
 	modeCount := 0
+	replacementID := ""
+	sourceID := ""
+	sourceSelected := false
+	identityFlags := false
+	replacementSelected := false
 	for i := 3; i < len(os.Args); i++ {
 		switch os.Args[i] {
+		case "--replacement-id", "--source-id":
+			if i+1 >= len(os.Args) {
+				failDoctorRepair(os.Args[i] + " requires a value")
+				return
+			}
+			identityFlags = true
+			if os.Args[i] == "--replacement-id" {
+				replacementSelected = true
+				replacementID = os.Args[i+1]
+			} else {
+				sourceID = os.Args[i+1]
+				sourceSelected = true
+			}
+			i++
 		case "--project":
 			if i+1 >= len(os.Args) {
 				failDoctorRepair("--project requires a value")
@@ -175,6 +196,14 @@ func cmdDoctorRepair(cfg store.Config) {
 		mode = diagnostic.RepairModeDryRun
 	} else if modeCount != 1 {
 		failDoctorRepair("exactly one of --plan, --dry-run, or --apply is required")
+		return
+	}
+	if identityFlags && check != diagnostic.CheckInvalidSessionIdentity {
+		failDoctorRepair("identity flags require --check invalid_session_identity")
+		return
+	}
+	if sourceSelected && !replacementSelected {
+		failDoctorRepair("--source-id requires --replacement-id")
 		return
 	}
 	if !diagnostic.IsRepairableCode(check) {
@@ -251,6 +280,34 @@ func cmdDoctorRepair(cfg store.Config) {
 	plan, err := buildRepairPlan(ctx, diagnostic.Scope{Store: s, Project: project}, report, check, mode)
 	if err != nil {
 		failDoctorRepair(err.Error())
+		return
+	}
+	if check == diagnostic.CheckInvalidSessionIdentity && replacementSelected {
+		plan = diagnostic.PlanSessionIdentityReplacement(diagnostic.Scope{Store: s, Project: project}, report, plan, sourceID, sourceSelected, replacementID)
+		if plan.Status == "blocked" {
+			writeDoctorRepairJSON(plan)
+			return
+		}
+		if mode == diagnostic.RepairModeApply {
+			result, err := s.ApplySessionIdentityRepair(*plan.IdentityRepair)
+			if err != nil {
+				failDoctorRepair(err.Error())
+				return
+			}
+			plan.Status = "applied"
+			if len(plan.Skipped) > 0 {
+				plan.Status = "partial"
+			}
+			plan.BackupPath = result.BackupPath
+			plan.Counts.SessionsApplied = 1
+			plan.Counts.ObservationsApplied = plan.IdentityRepair.Observations
+			plan.Counts.PromptsApplied = plan.IdentityRepair.Prompts
+		} else if mode == diagnostic.RepairModePlan {
+			plan.Status = "planned"
+		} else {
+			plan.Status = "dry_run"
+		}
+		writeDoctorRepairJSON(plan)
 		return
 	}
 	if check == diagnostic.CheckOrphanedObservationSession {

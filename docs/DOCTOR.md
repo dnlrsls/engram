@@ -21,6 +21,13 @@ Flags:
 - `--check CODE` runs one registered check and fails loudly for unknown codes.
 - `doctor repair` supports exactly `invalid_session_identity`, `manual_session_name_project_mismatch`, `orphaned_observation_session`, `session_project_directory_mismatch`, `sync_mutation_required_fields`, and `sync_target_closed_space`. It requires `--project`, `--check`, and exactly one mode: `--plan`, `--dry-run`, or `--apply`. `sync_mutation_required_fields` may omit `--project` and the mode; an omitted mode defaults to `--dry-run`. Its optional project scopes title repair, supersession, quarantine, and source-title repair. The diagnostic-only checks are `ambiguous_active_runtime_sessions`, `sqlite_lock_contention`, and `unowned_session_project`; a rejected repair names the corresponding `engram doctor --check <code>` continuation.
 
+For `invalid_session_identity`, supply an unused canonical `--replacement-id`. Without it repair remains a nonmutating `noop`. Plan and dry-run show `identity_repair` with exact source, replacement, reference and retired journal counts; `blockers` explains collisions and unsafe evidence. For multiple whitespace-only sources specify the exact `--source-id SOURCE` (use `--source-id ''` for the empty string). Apply revalidates under the SQLite writer lock, backs up the database, atomically remaps references and retires legacy journal evidence; corrected state is published only for enrolled projects. Quarantined pulled identities are not locally repairable. Unrepaired findings remain in `skipped`; an apply that repairs one source while others remain reports `partial`. Re-run doctor after apply; other malformed sources may remain. To roll back, stop Engram and manually restore the reported backup.
+
+```bash
+engram doctor repair --project engram --check invalid_session_identity --replacement-id canonical-session --plan
+engram doctor repair --project engram --check invalid_session_identity --replacement-id canonical-session --apply
+```
+
 ## MCP
 
 Agents can call `mem_doctor` with the same contract as `engram doctor --json`:
@@ -97,7 +104,7 @@ Title restoration supports `sync_mutation_required_fields` only when a pending o
 
 The same repair also supersedes a pending local upsert when a local session/observation delete tombstone or prompt tombstone proves the entity was deleted while its project was unenrolled. `superseded` is auditable local evidence, not a cloud acknowledgement: it is excluded from transport and allows re-enrollment backfill to reconstruct the current local delete state. Superseded evidence missing its reason, evidence, or timestamp remains blocking until manually repaired; complete terminal quarantined and superseded rows remain informational without keeping doctor in warning or blocked status.
 
-Repair never deletes or deduplicates rows, never edits sync cursors, never acknowledges undelivered mutations, and never writes cloud state. `--plan` and `--dry-run` are non-mutating. `--apply` creates a SQLite backup under `<ENGRAM_DATA_DIR>/backups/` before a project reclassification transaction updates only:
+Project reclassification never deletes or deduplicates rows. Identity repair replaces the malformed source session row after remapping its references; it retains old journal rows as auditable retired evidence rather than deleting their payload history. Repair never edits sync cursors, acknowledges undelivered mutations, or writes cloud state. `--plan` and `--dry-run` are non-mutating. `--apply` creates a SQLite backup under `<ENGRAM_DATA_DIR>/backups/` before a project reclassification transaction updates only:
 
 - `sessions.project`
 - `sessions.ownership_mode` (`project_owned` for a session named `manual-save-{target_project}`, otherwise `shared`)
@@ -119,7 +126,7 @@ For `sync_mutation_required_fields`, `repairs` lists title-only observation upse
   "project": "sias-app",
   "check": "session_project_directory_mismatch",
   "mode": "plan|dry_run|apply",
-  "status": "planned|dry_run|applied|noop",
+  "status": "planned|dry_run|applied|partial|blocked|noop",
   "actions": [
     {
       "session_id": "session-id",
