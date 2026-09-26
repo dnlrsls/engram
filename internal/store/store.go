@@ -292,12 +292,13 @@ type UpdateObservationParams struct {
 }
 
 type Prompt struct {
-	ID        int64  `json:"id"`
-	SyncID    string `json:"sync_id"`
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	CreatedAt string `json:"created_at"`
+	SourceInboxID string `json:"source_inbox_id,omitempty"`
+	ID            int64  `json:"id"`
+	SyncID        string `json:"sync_id"`
+	SessionID     string `json:"session_id"`
+	Content       string `json:"content"`
+	Project       string `json:"project,omitempty"`
+	CreatedAt     string `json:"created_at"`
 }
 
 type AddPromptParams struct {
@@ -603,14 +604,15 @@ type syncObservationPayload struct {
 }
 
 type syncPromptPayload struct {
-	SyncID     string  `json:"sync_id"`
-	SessionID  string  `json:"session_id"`
-	Content    string  `json:"content"`
-	Project    *string `json:"project,omitempty"`
-	CreatedAt  string  `json:"created_at,omitempty"`
-	Deleted    bool    `json:"deleted,omitempty"`
-	DeletedAt  *string `json:"deleted_at,omitempty"`
-	HardDelete bool    `json:"hard_delete,omitempty"`
+	SourceInboxID string  `json:"source_inbox_id,omitempty"`
+	SyncID        string  `json:"sync_id"`
+	SessionID     string  `json:"session_id"`
+	Content       string  `json:"content"`
+	Project       *string `json:"project,omitempty"`
+	CreatedAt     string  `json:"created_at,omitempty"`
+	Deleted       bool    `json:"deleted,omitempty"`
+	DeletedAt     *string `json:"deleted_at,omitempty"`
+	HardDelete    bool    `json:"hard_delete,omitempty"`
 }
 
 // syncRelationPayload is the wire format for a memory_relations row sent over
@@ -2385,9 +2387,9 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 		if op == SyncOpUpsert {
 			var local syncPromptPayload
 			err := tx.QueryRow(
-				`SELECT sync_id, session_id, content, project, created_at FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`,
+				`SELECT sync_id, session_id, content, project, created_at, ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`,
 				body.SyncID,
-			).Scan(&local.SyncID, &local.SessionID, &local.Content, &local.Project, &local.CreatedAt)
+			).Scan(&local.SyncID, &local.SessionID, &local.Content, &local.Project, &local.CreatedAt, &local.SourceInboxID)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return cloudUpgradeLegacyMutationEvaluation{}, err
 			}
@@ -3830,11 +3832,12 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 			return err
 		}
 		return s.enqueueSyncMutationTx(tx, SyncEntityPrompt, syncID, SyncOpUpsert, syncPromptPayload{
-			SyncID:    syncID,
-			SessionID: p.SessionID,
-			Content:   content,
-			Project:   nullableString(p.Project),
-			CreatedAt: createdAt,
+			SyncID:        syncID,
+			SessionID:     p.SessionID,
+			Content:       content,
+			Project:       nullableString(p.Project),
+			CreatedAt:     createdAt,
+			SourceInboxID: p.SourceInboxID,
 		})
 	})
 	if err != nil {
@@ -5664,7 +5667,7 @@ func (s *Store) exportWithProjectScope(project string) (_ *ExportData, err error
 	}
 
 	// Prompts
-	promptQuery := "SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at FROM user_prompts"
+	promptQuery := "SELECT id, ifnull(sync_id, '') as sync_id, session_id, content, ifnull(project, '') as project, created_at, ifnull(source_inbox_id, '') FROM user_prompts"
 	promptArgs := []any{}
 	if project != "" {
 		promptQuery += ` WHERE id IN (SELECT id FROM user_prompts WHERE project = ?
@@ -5681,7 +5684,7 @@ func (s *Store) exportWithProjectScope(project string) (_ *ExportData, err error
 	defer promptRows.Close()
 	for promptRows.Next() {
 		var p Prompt
-		if err := promptRows.Scan(&p.ID, &p.SyncID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt); err != nil {
+		if err := promptRows.Scan(&p.ID, &p.SyncID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt, &p.SourceInboxID); err != nil {
 			return nil, err
 		}
 		data.Prompts = append(data.Prompts, p)
@@ -5863,9 +5866,9 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
 		}
 		res, err := s.execHook(tx,
-			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at)
-			 SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM user_prompts WHERE sync_id = ?)`,
-			syncID, p.SessionID, p.Content, p.Project, p.CreatedAt, syncID,
+			`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at, source_inbox_id)
+			 SELECT ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM user_prompts WHERE sync_id = ? OR (session_id = ? AND source_inbox_id = ?))`,
+			syncID, p.SessionID, p.Content, p.Project, p.CreatedAt, nullableString(p.SourceInboxID), syncID, p.SessionID, nullableString(p.SourceInboxID),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
@@ -9125,8 +9128,8 @@ func (s *Store) enqueueRescuedProjectMutationsTx(tx *sql.Tx, target string, sess
 	}
 	for _, id := range p.PromptIDs {
 		var payload syncPromptPayload
-		err := tx.QueryRow(`SELECT sync_id, session_id, content, project, created_at FROM user_prompts WHERE id = ? AND project = ?`, id, target).
-			Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt)
+		err := tx.QueryRow(`SELECT sync_id, session_id, content, project, created_at, ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ? AND project = ?`, id, target).
+			Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt, &payload.SourceInboxID)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -9681,7 +9684,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string, source
 	mutationSource := backfillMutationSource(source)
 	// ── Live prompts ──────────────────────────────────────────────────────────
 	rows, err := s.queryItHook(tx, `
-		SELECT p.sync_id, p.session_id, p.content, p.project, p.created_at
+		SELECT p.sync_id, p.session_id, p.content, p.project, p.created_at, ifnull(p.source_inbox_id, '')
 		FROM user_prompts p
 		LEFT JOIN sessions s ON s.id = p.session_id
 		WHERE (
@@ -9708,7 +9711,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string, source
 	var pending []syncPromptPayload
 	for rows.Next() {
 		var payload syncPromptPayload
-		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt); err != nil {
+		if err := rows.Scan(&payload.SyncID, &payload.SessionID, &payload.Content, &payload.Project, &payload.CreatedAt, &payload.SourceInboxID); err != nil {
 			return closeRowsWithError(rows, err)
 		}
 		pending = append(pending, payload)
@@ -11002,17 +11005,27 @@ func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error
 	}
 
 	var existingID int64
+	if payload.SourceInboxID != "" {
+		var owner string
+		err := tx.QueryRow(`SELECT sync_id FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, payload.SessionID, payload.SourceInboxID).Scan(&owner)
+		if err == nil && owner != payload.SyncID {
+			return fmt.Errorf("prompt inbox identity conflict for session %q and inbox ID %q", payload.SessionID, payload.SourceInboxID)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
 	err = tx.QueryRow(`SELECT id FROM user_prompts WHERE sync_id = ? ORDER BY id DESC LIMIT 1`, payload.SyncID).Scan(&existingID)
 	if err == sql.ErrNoRows {
 		if strings.TrimSpace(payload.CreatedAt) == "" {
 			_, err = s.execHook(tx,
-				`INSERT INTO user_prompts (sync_id, session_id, content, project) VALUES (?, ?, ?, ?)`,
-				payload.SyncID, payload.SessionID, payload.Content, payload.Project,
+				`INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id) VALUES (?, ?, ?, ?, ?)`,
+				payload.SyncID, payload.SessionID, payload.Content, payload.Project, nullableString(payload.SourceInboxID),
 			)
 		} else {
 			_, err = s.execHook(tx,
-				`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at) VALUES (?, ?, ?, ?, ?)`,
-				payload.SyncID, payload.SessionID, payload.Content, payload.Project, payload.CreatedAt,
+				`INSERT INTO user_prompts (sync_id, session_id, content, project, created_at, source_inbox_id) VALUES (?, ?, ?, ?, ?, ?)`,
+				payload.SyncID, payload.SessionID, payload.Content, payload.Project, payload.CreatedAt, nullableString(payload.SourceInboxID),
 			)
 		}
 		return err
@@ -11025,9 +11038,10 @@ func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error
 		 SET session_id = ?,
 		     content = ?,
 		     project = ?,
+		     source_inbox_id = COALESCE(?, source_inbox_id),
 		     created_at = CASE WHEN ? = '' THEN created_at ELSE ? END
 		 WHERE id = ?`,
-		payload.SessionID, payload.Content, payload.Project, strings.TrimSpace(payload.CreatedAt), payload.CreatedAt, existingID,
+		payload.SessionID, payload.Content, payload.Project, nullableString(payload.SourceInboxID), strings.TrimSpace(payload.CreatedAt), payload.CreatedAt, existingID,
 	)
 	return err
 }

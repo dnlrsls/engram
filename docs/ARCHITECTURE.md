@@ -2,7 +2,7 @@
 
 # Architecture
 
-Local `POST /prompts` accepts optional `source_inbox_id` alongside `session_id`, `content`, and `project`. A nonempty ID identifies one prompt within its session: replay returns the existing prompt ID with the same `201` and `{"id":…, "status":"saved"}` response, without another sync mutation or write notification. Distinct IDs may contain identical text. Omitting the ID continues to append a new prompt on every call. Project ownership checks still apply before replay. Sync/import propagation and replay after deletion are not yet supported.
+Local `POST /prompts` accepts optional `source_inbox_id` alongside `session_id`, `content`, and `project`. A nonempty ID identifies one prompt within its session: replay returns the existing prompt ID with the same `201` and `{"id":…, "status":"saved"}` response, without another sync mutation or write notification. Distinct IDs may contain identical text. Omitting the ID continues to append a new prompt on every call. Project ownership checks still apply before replay. Prompt sync upserts and exports preserve the optional identity, so replay after sync or import returns the existing prompt without a new mutation. Older payloads without the field remain valid. Replay after deletion is not yet blocked; deletion tombstones do not retain the inbox identity.
 
 - [How It Works](#how-it-works)
 - [Session Lifecycle](#session-lifecycle)
