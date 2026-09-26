@@ -836,7 +836,11 @@ func TestPromptInboxIdentitySyncRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close prompt sync mutations: %v", err)
+		}
+	}()
 	nextSeq := int64(1)
 	for rows.Next() {
 		var payload string
