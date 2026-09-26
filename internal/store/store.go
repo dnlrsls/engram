@@ -61,6 +61,7 @@ var (
 	ErrSessionDeleteBlocked        = errors.New("session deletion is blocked while cloud sync enrollment is active")
 	ErrObservationNotFound         = errors.New("observation not found")
 	ErrPromptNotFound              = errors.New("prompt not found")
+	ErrPromptInboxDeleted          = errors.New("prompt inbox identity was deleted")
 	ErrProjectNotFound             = errors.New("project not found")
 	ErrProjectRequired             = errors.New("project identity is required")
 	ErrInvalidSessionOwnershipMode = errors.New("invalid session ownership mode")
@@ -676,13 +677,22 @@ type backupObservation struct {
 }
 
 // ExportData is the full serializable direct-backup dump of the engram database.
+type PromptTombstone struct {
+	SyncID        string  `json:"sync_id"`
+	SessionID     string  `json:"session_id"`
+	Project       *string `json:"project,omitempty"`
+	SourceInboxID string  `json:"source_inbox_id,omitempty"`
+	DeletedAt     string  `json:"deleted_at"`
+}
+
 type ExportData struct {
-	Version      string           `json:"version"`
-	ExportedAt   string           `json:"exported_at"`
-	Sessions     []Session        `json:"sessions"`
-	Observations []Observation    `json:"observations"`
-	Prompts      []Prompt         `json:"prompts"`
-	Relations    []BackupRelation `json:"relations,omitempty"`
+	PromptTombstones []PromptTombstone `json:"prompt_tombstones,omitempty"`
+	Version          string            `json:"version"`
+	ExportedAt       string            `json:"exported_at"`
+	Sessions         []Session         `json:"sessions"`
+	Observations     []Observation     `json:"observations"`
+	Prompts          []Prompt          `json:"prompts"`
+	Relations        []BackupRelation  `json:"relations,omitempty"`
 }
 
 // MarshalJSON projects observations through the backup-only form so direct
@@ -693,15 +703,16 @@ func (d ExportData) MarshalJSON() ([]byte, error) {
 		observations[i] = backupObservation{Observation: observation, Pinned: observation.Pinned}
 	}
 	return json.Marshal(struct {
-		Version      string              `json:"version"`
-		ExportedAt   string              `json:"exported_at"`
-		Sessions     []Session           `json:"sessions"`
-		Observations []backupObservation `json:"observations"`
-		Prompts      []Prompt            `json:"prompts"`
-		Relations    []BackupRelation    `json:"relations,omitempty"`
+		Version          string              `json:"version"`
+		ExportedAt       string              `json:"exported_at"`
+		Sessions         []Session           `json:"sessions"`
+		Observations     []backupObservation `json:"observations"`
+		Prompts          []Prompt            `json:"prompts"`
+		Relations        []BackupRelation    `json:"relations,omitempty"`
+		PromptTombstones []PromptTombstone   `json:"prompt_tombstones,omitempty"`
 	}{
 		Version: d.Version, ExportedAt: d.ExportedAt, Sessions: d.Sessions,
-		Observations: observations, Prompts: d.Prompts, Relations: d.Relations,
+		Observations: observations, Prompts: d.Prompts, Relations: d.Relations, PromptTombstones: d.PromptTombstones,
 	})
 }
 
@@ -728,12 +739,13 @@ type exportedSessionDirectory struct {
 // token fails the whole unmarshal with an error naming the offending session.
 func (d *ExportData) UnmarshalJSON(data []byte) error {
 	var decoded struct {
-		Version      string              `json:"version"`
-		ExportedAt   string              `json:"exported_at"`
-		Sessions     []json.RawMessage   `json:"sessions"`
-		Observations []backupObservation `json:"observations"`
-		Prompts      []Prompt            `json:"prompts"`
-		Relations    []BackupRelation    `json:"relations"`
+		Version          string              `json:"version"`
+		ExportedAt       string              `json:"exported_at"`
+		Sessions         []json.RawMessage   `json:"sessions"`
+		Observations     []backupObservation `json:"observations"`
+		Prompts          []Prompt            `json:"prompts"`
+		Relations        []BackupRelation    `json:"relations"`
+		PromptTombstones []PromptTombstone   `json:"prompt_tombstones"`
 	}
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return err
@@ -764,7 +776,7 @@ func (d *ExportData) UnmarshalJSON(data []byte) error {
 	}
 	*d = ExportData{
 		Version: decoded.Version, ExportedAt: decoded.ExportedAt, Sessions: sessions,
-		Observations: observations, Prompts: decoded.Prompts, Relations: decoded.Relations,
+		Observations: observations, Prompts: decoded.Prompts, Relations: decoded.Relations, PromptTombstones: decoded.PromptTombstones,
 	}
 	return nil
 }
@@ -1247,6 +1259,7 @@ func (s *Store) migrate() error {
 
 			CREATE TABLE IF NOT EXISTS prompt_tombstones (
 				sync_id    TEXT PRIMARY KEY,
+                source_inbox_id TEXT,
 				session_id TEXT,
 				project    TEXT,
 				deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -1390,6 +1403,9 @@ func (s *Store) migrate() error {
 	if err := s.addColumnIfNotExists("user_prompts", "source_inbox_id", "TEXT"); err != nil {
 		return err
 	}
+	if err := s.addColumnIfNotExists("prompt_tombstones", "source_inbox_id", "TEXT"); err != nil {
+		return err
+	}
 	if err := s.addColumnIfNotExists("sync_delete_tombstones", "last_remote_mutation_seq", "INTEGER"); err != nil {
 		return err
 	}
@@ -1407,6 +1423,7 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_prompts_sync_id ON user_prompts(sync_id);
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_prompts_source_inbox ON user_prompts(session_id, source_inbox_id) WHERE source_inbox_id IS NOT NULL;
 		CREATE INDEX IF NOT EXISTS idx_prompt_tombstones_project ON prompt_tombstones(project, deleted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_prompt_tombstones_inbox ON prompt_tombstones(session_id, source_inbox_id) WHERE source_inbox_id IS NOT NULL;
 		CREATE INDEX IF NOT EXISTS idx_sync_delete_tombstones_project ON sync_delete_tombstones(project, deleted_at DESC);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_target_seq ON sync_mutations(target_key, seq);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_pending ON sync_mutations(target_key, acked_at, seq);
@@ -3800,6 +3817,15 @@ func (s *Store) AddPromptWithResult(p AddPromptParams) (int64, bool, error) {
 			}
 			p.Project = resolved
 		}
+		if p.SourceInboxID != "" {
+			deleted, err := promptInboxDeletedTx(tx, p.SessionID, p.SourceInboxID)
+			if err != nil {
+				return err
+			}
+			if deleted {
+				return ErrPromptInboxDeleted
+			}
+		}
 		syncID := newSyncID("prompt")
 		query := `INSERT INTO user_prompts (sync_id, session_id, content, project, source_inbox_id) VALUES (?, ?, ?, ?, ?)`
 		if p.SourceInboxID != "" {
@@ -4084,14 +4110,14 @@ func (s *Store) DeleteSession(id string) error {
 		}
 
 		deletedAt := Now()
-		promptRows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, '') FROM user_prompts WHERE session_id = ? ORDER BY id ASC`, id)
+		promptRows, err := s.queryItHook(tx, `SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE session_id = ? ORDER BY id ASC`, id)
 		if err != nil {
 			return fmt.Errorf("delete session: load prompts: %w", err)
 		}
 		var prompts []syncPromptPayload
 		for promptRows.Next() {
 			var prompt syncPromptPayload
-			if err := promptRows.Scan(&prompt.SyncID, &prompt.SessionID, &prompt.Project); err != nil {
+			if err := promptRows.Scan(&prompt.SyncID, &prompt.SessionID, &prompt.Project, &prompt.SourceInboxID); err != nil {
 				return closeRowsWithError(promptRows, fmt.Errorf("delete session: load prompts: %w", err))
 			}
 			if strings.TrimSpace(derefString(prompt.Project)) == "" {
@@ -4106,7 +4132,7 @@ func (s *Store) DeleteSession(id string) error {
 			return err
 		}
 		for _, prompt := range prompts {
-			if err := s.recordPromptTombstoneTx(tx, prompt.SyncID, prompt.SessionID, prompt.Project, deletedAt); err != nil {
+			if err := s.recordPromptTombstoneTx(tx, prompt.SyncID, prompt.SessionID, prompt.Project, prompt.SourceInboxID, deletedAt); err != nil {
 				return fmt.Errorf("delete session: record prompt tombstone: %w", err)
 			}
 		}
@@ -4178,7 +4204,7 @@ func (s *Store) DeletePrompt(id int64) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		var payload syncPromptPayload
 		var project string
-		if err := tx.QueryRow(`SELECT sync_id, session_id, ifnull(project, '') FROM user_prompts WHERE id = ?`, id).Scan(&payload.SyncID, &payload.SessionID, &project); err != nil {
+		if err := tx.QueryRow(`SELECT sync_id, session_id, ifnull(project, ''), ifnull(source_inbox_id, '') FROM user_prompts WHERE id = ?`, id).Scan(&payload.SyncID, &payload.SessionID, &project, &payload.SourceInboxID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
 			}
@@ -4209,7 +4235,7 @@ func (s *Store) DeletePrompt(id int64) error {
 		if n == 0 {
 			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
 		}
-		if err := s.recordPromptTombstoneTx(tx, payload.SyncID, payload.SessionID, payload.Project, now); err != nil {
+		if err := s.recordPromptTombstoneTx(tx, payload.SyncID, payload.SessionID, payload.Project, payload.SourceInboxID, now); err != nil {
 			return fmt.Errorf("delete prompt: upsert tombstone: %w", err)
 		}
 		enrolled, err := isProjectEnrolledTx(tx, project)
@@ -5559,18 +5585,18 @@ func (s *Store) ExportLocalDeleteTombstones(project string) ([]SyncMutation, err
 		promptArgs = append(promptArgs, project)
 	}
 	promptRows, err := s.queryItHook(s.db, `
-		SELECT p.sync_id, ifnull(p.session_id, ''), coalesce(nullif(p.project, ''), nullif(s.project, ''), ifnull((SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = p.session_id AND st.active = 1), '')), p.deleted_at
+		SELECT p.sync_id, ifnull(p.session_id, ''), coalesce(nullif(p.project, ''), nullif(s.project, ''), ifnull((SELECT st.project FROM sync_delete_tombstones st WHERE st.entity = 'session' AND st.entity_key = p.session_id AND st.active = 1), '')), p.deleted_at, ifnull(p.source_inbox_id, '')
 		FROM prompt_tombstones p LEFT JOIN sessions s ON s.id = p.session_id
 		WHERE `+promptWhere, promptArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("export local prompt tombstones: %w", err)
 	}
 	for promptRows.Next() {
-		var syncID, sessionID, rowProject, deletedAt string
-		if err := promptRows.Scan(&syncID, &sessionID, &rowProject, &deletedAt); err != nil {
+		var syncID, sessionID, rowProject, deletedAt, inboxID string
+		if err := promptRows.Scan(&syncID, &sessionID, &rowProject, &deletedAt, &inboxID); err != nil {
 			return nil, closeRowsWithError(promptRows, err)
 		}
-		raw, err := json.Marshal(syncPromptPayload{SyncID: syncID, SessionID: sessionID, Project: nullableString(rowProject), Deleted: true, DeletedAt: &deletedAt, HardDelete: true})
+		raw, err := json.Marshal(syncPromptPayload{SyncID: syncID, SessionID: sessionID, Project: nullableString(rowProject), SourceInboxID: inboxID, Deleted: true, DeletedAt: &deletedAt, HardDelete: true})
 		if err != nil {
 			return nil, closeRowsWithError(promptRows, err)
 		}
@@ -5690,6 +5716,31 @@ func (s *Store) exportWithProjectScope(project string) (_ *ExportData, err error
 		data.Prompts = append(data.Prompts, p)
 	}
 	if err := promptRows.Err(); err != nil {
+		return nil, err
+	}
+
+	tombstoneQuery := `SELECT t.sync_id, ifnull(t.session_id, ''), t.project, ifnull(t.source_inbox_id, ''), t.deleted_at FROM prompt_tombstones t`
+	tombstoneArgs := []any{}
+	if project != "" {
+		tombstoneQuery += ` LEFT JOIN sessions s ON s.id = t.session_id WHERE coalesce(nullif(t.project, ''), nullif(s.project, ''), '') = ?`
+		tombstoneArgs = append(tombstoneArgs, project)
+	}
+	tombstoneQuery += ` ORDER BY t.sync_id`
+	tombstoneRows, err := s.queryItHook(s.db, tombstoneQuery, tombstoneArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("export prompt tombstones: %w", err)
+	}
+	for tombstoneRows.Next() {
+		var tombstone PromptTombstone
+		if err := tombstoneRows.Scan(&tombstone.SyncID, &tombstone.SessionID, &tombstone.Project, &tombstone.SourceInboxID, &tombstone.DeletedAt); err != nil {
+			return nil, closeRowsWithError(tombstoneRows, err)
+		}
+		data.PromptTombstones = append(data.PromptTombstones, tombstone)
+	}
+	if err := tombstoneRows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tombstoneRows.Err(); err != nil {
 		return nil, err
 	}
 
@@ -5851,12 +5902,39 @@ func (s *Store) Import(data *ExportData) (*ImportResult, error) {
 		result.ObservationsImported += int(n)
 	}
 
+	// Restore deletion identities before admitting prompts from this backup.
+	for _, tombstone := range data.PromptTombstones {
+		if tombstone.SyncID == "" {
+			return nil, errors.New("import prompt tombstone: sync id is required")
+		}
+		if tombstone.SourceInboxID != "" {
+			if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ? AND source_inbox_id = ?`, tombstone.SessionID, tombstone.SourceInboxID); err != nil {
+				return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, err)
+			}
+		}
+		if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, tombstone.SyncID); err != nil {
+			return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, err)
+		}
+		if err := s.recordPromptTombstoneTx(tx, tombstone.SyncID, tombstone.SessionID, tombstone.Project, tombstone.SourceInboxID, tombstone.DeletedAt); err != nil {
+			return nil, fmt.Errorf("import prompt tombstone %q: %w", tombstone.SyncID, err)
+		}
+	}
 	// Import prompts
 	for _, p := range data.Prompts {
+		if p.SourceInboxID != "" {
+			deleted, err := promptInboxDeletedTx(tx, p.SessionID, p.SourceInboxID)
+			if err != nil {
+				return nil, fmt.Errorf("import prompt %d: %w", p.ID, err)
+			}
+			if deleted {
+				continue
+			}
+		}
 		syncID := normalizeExistingSyncID(p.SyncID, "prompt")
 		var tombstoneDeletedAt string
-		if err := tx.QueryRow(`SELECT deleted_at FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&tombstoneDeletedAt); err == nil {
-			if isStalePromptUpsert(syncPromptPayload{CreatedAt: p.CreatedAt}, tombstoneDeletedAt) {
+		var deletedInboxID string
+		if err := tx.QueryRow(`SELECT deleted_at, ifnull(source_inbox_id, '') FROM prompt_tombstones WHERE sync_id = ?`, syncID).Scan(&tombstoneDeletedAt, &deletedInboxID); err == nil {
+			if deletedInboxID != "" || isStalePromptUpsert(syncPromptPayload{CreatedAt: p.CreatedAt}, tombstoneDeletedAt) {
 				continue
 			}
 			if _, err := s.execHook(tx, `DELETE FROM prompt_tombstones WHERE sync_id = ?`, syncID); err != nil {
@@ -9059,16 +9137,23 @@ func (s *Store) recordCloudDeleteTombstoneTx(tx *sql.Tx, targetKey, entity, enti
 	return err
 }
 
-func (s *Store) recordPromptTombstoneTx(tx *sql.Tx, syncID, sessionID string, project *string, deletedAt string) error {
+func promptInboxDeletedTx(tx *sql.Tx, sessionID, inboxID string) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM prompt_tombstones WHERE session_id = ? AND source_inbox_id = ?)`, sessionID, inboxID).Scan(&exists)
+	return exists, err
+}
+
+func (s *Store) recordPromptTombstoneTx(tx *sql.Tx, syncID, sessionID string, project *string, inboxID, deletedAt string) error {
 	if project != nil {
 		normalized, _ := NormalizeProject(strings.TrimSpace(*project))
 		project = nullableString(normalized)
 	}
 	_, err := s.execHook(tx,
-		`INSERT INTO prompt_tombstones (sync_id, session_id, project, deleted_at)
-		 VALUES (?, ?, ?, ?)
-		 ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project, deleted_at = excluded.deleted_at`,
-		syncID, sessionID, project, deletedAt,
+		`INSERT INTO prompt_tombstones (sync_id, session_id, project, source_inbox_id, deleted_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(sync_id) DO UPDATE SET session_id = excluded.session_id, project = excluded.project,
+             source_inbox_id = COALESCE(excluded.source_inbox_id, prompt_tombstones.source_inbox_id), deleted_at = excluded.deleted_at`,
+		syncID, sessionID, project, nullableString(inboxID), deletedAt,
 	)
 	return err
 }
@@ -9732,7 +9817,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string, source
 
 	// ── Tombstoned prompts ────────────────────────────────────────────────────
 	tombstoneRows, err := s.queryItHook(tx, `
-		SELECT prompt_tombstones.sync_id, prompt_tombstones.session_id, prompt_tombstones.project, prompt_tombstones.deleted_at
+		SELECT prompt_tombstones.sync_id, prompt_tombstones.session_id, prompt_tombstones.project, prompt_tombstones.deleted_at, ifnull(prompt_tombstones.source_inbox_id, '')
 		FROM prompt_tombstones
 		LEFT JOIN sessions s ON s.id = prompt_tombstones.session_id
 		WHERE (
@@ -9760,7 +9845,7 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string, source
 	var tombstonePending []syncPromptPayload
 	for tombstoneRows.Next() {
 		var payload syncPromptPayload
-		if err := tombstoneRows.Scan(&payload.SyncID, &payload.SessionID, &payload.Project, &payload.DeletedAt); err != nil {
+		if err := tombstoneRows.Scan(&payload.SyncID, &payload.SessionID, &payload.Project, &payload.DeletedAt, &payload.SourceInboxID); err != nil {
 			return closeRowsWithError(tombstoneRows, err)
 		}
 		payload.Deleted = true
@@ -10988,12 +11073,25 @@ func (s *Store) applyObservationDeleteTx(tx *sql.Tx, payload syncObservationPayl
 
 func (s *Store) applyPromptUpsertTx(tx *sql.Tx, payload syncPromptPayload) error {
 	var tombstoneDeletedAt string
-	err := tx.QueryRow(`SELECT deleted_at FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID).Scan(&tombstoneDeletedAt)
+	var deletedInboxID string
+	err := tx.QueryRow(`SELECT deleted_at, ifnull(source_inbox_id, '') FROM prompt_tombstones WHERE sync_id = ?`, payload.SyncID).Scan(&tombstoneDeletedAt, &deletedInboxID)
+	if err == nil && deletedInboxID != "" {
+		return nil
+	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	if err == nil && isStalePromptUpsert(payload, tombstoneDeletedAt) {
 		return nil
+	}
+	if payload.SourceInboxID != "" {
+		deleted, lookupErr := promptInboxDeletedTx(tx, payload.SessionID, payload.SourceInboxID)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if deleted {
+			return nil
+		}
 	}
 	if err := requirePulledParentSessionTx(tx, payload.SessionID); err != nil {
 		return err
@@ -11050,6 +11148,17 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 	if strings.TrimSpace(payload.SyncID) == "" {
 		return nil
 	}
+	var sessionID, inboxID string
+	err := tx.QueryRow(`SELECT session_id, ifnull(source_inbox_id, '') FROM user_prompts WHERE sync_id = ?`, payload.SyncID).Scan(&sessionID, &inboxID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if payload.SessionID == "" {
+		payload.SessionID = sessionID
+	}
+	if payload.SourceInboxID == "" {
+		payload.SourceInboxID = inboxID
+	}
 	if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE sync_id = ?`, payload.SyncID); err != nil {
 		return err
 	}
@@ -11058,7 +11167,7 @@ func (s *Store) applyPromptDeleteTx(tx *sql.Tx, payload syncPromptPayload) error
 		now := Now()
 		deletedAt = &now
 	}
-	return s.recordPromptTombstoneTx(tx, payload.SyncID, payload.SessionID, payload.Project, *deletedAt)
+	return s.recordPromptTombstoneTx(tx, payload.SyncID, payload.SessionID, payload.Project, payload.SourceInboxID, *deletedAt)
 }
 
 func isStalePromptUpsert(payload syncPromptPayload, tombstoneDeletedAt string) bool {

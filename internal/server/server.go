@@ -1056,6 +1056,8 @@ func (s *Server) handleAddPrompt(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, store.ErrPromptContentRequired):
 			jsonError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, store.ErrPromptInboxDeleted):
+			jsonError(w, http.StatusConflict, err.Error())
 		case writeOwnershipError(w, body.SessionID, err):
 		default:
 			jsonError(w, http.StatusInternalServerError, err.Error())

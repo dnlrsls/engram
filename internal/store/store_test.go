@@ -944,6 +944,210 @@ func TestPromptInboxIdentityExportImport(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityDeletedLocal(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("deleted-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "deleted-inbox", Project: "engram", Content: "same", SourceInboxID: "one"}
+	id, _, err := s.AddPromptWithResult(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePrompt(id); err != nil {
+		t.Fatal(err)
+	}
+	var before, after int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	replayID, inserted, err := s.AddPromptWithResult(p)
+	if !errors.Is(err, ErrPromptInboxDeleted) || replayID != 0 || inserted {
+		t.Fatalf("deleted replay: %d %v %v", replayID, inserted, err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&after); err != nil || after != before {
+		t.Fatalf("mutations %d -> %d: %v", before, after, err)
+	}
+	p.SourceInboxID = "two"
+	if _, inserted, err := s.AddPromptWithResult(p); err != nil || !inserted {
+		t.Fatalf("new inbox ID: %v %v", inserted, err)
+	}
+}
+
+func TestPromptInboxIdentityDeletedSession(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("deleted-session-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "deleted-session-inbox", Project: "engram", Content: "same", SourceInboxID: "one"}
+	if _, _, err := s.AddPromptWithResult(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteSession(p.SessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession(p.SessionID, "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if id, inserted, err := s.AddPromptWithResult(p); !errors.Is(err, ErrPromptInboxDeleted) || id != 0 || inserted {
+		t.Fatalf("session replay: %d %v %v", id, inserted, err)
+	}
+}
+
+func TestPromptInboxIdentityDeletedPulled(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("pulled-deleted-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	deletion := `{"sync_id":"old-sync","session_id":"pulled-deleted-inbox","source_inbox_id":"one","deleted":true}`
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: "old-sync", Op: SyncOpDelete, Payload: deletion}); err != nil {
+		t.Fatal(err)
+	}
+	upsert := `{"sync_id":"fresh-sync","session_id":"pulled-deleted-inbox","content":"same","source_inbox_id":"one"}`
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 2, Entity: SyncEntityPrompt, EntityKey: "fresh-sync", Op: SyncOpUpsert, Payload: upsert}); err != nil {
+		t.Fatalf("pulled replay: %v", err)
+	}
+	var count int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM user_prompts WHERE session_id = ?`, "pulled-deleted-inbox").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("rows: %d %v", count, err)
+	}
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = ? AND entity_key = ?`, SyncEntityPrompt, "fresh-sync").Scan(&count); err != nil || count != 0 {
+		t.Fatalf("new mutations: %d %v", count, err)
+	}
+}
+
+func TestPromptInboxIdentityDeletedPulledBackfill(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("pulled-backfill-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "pulled-backfill-inbox", Project: "engram", Content: "same", SourceInboxID: "one"}
+	id, _, err := s.AddPromptWithResult(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var syncID string
+	if err := s.DB().QueryRow(`SELECT sync_id FROM user_prompts WHERE id = ?`, id).Scan(&syncID); err != nil {
+		t.Fatal(err)
+	}
+	deletion := fmt.Sprintf(`{"sync_id":%q,"session_id":"pulled-backfill-inbox","deleted":true}`, syncID)
+	if err := s.ApplyPulledMutation(DefaultSyncTargetKey, SyncMutation{Seq: 1, Entity: SyncEntityPrompt, EntityKey: syncID, Op: SyncOpDelete, Payload: deletion}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.AddPromptWithResult(p); !errors.Is(err, ErrPromptInboxDeleted) {
+		t.Fatalf("backfilled deletion: %v", err)
+	}
+	mutations, err := s.ExportLocalDeleteTombstones("engram")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, mutation := range mutations {
+		if mutation.Entity != SyncEntityPrompt || mutation.EntityKey != syncID {
+			continue
+		}
+		var payload syncPromptPayload
+		if err := json.Unmarshal([]byte(mutation.Payload), &payload); err != nil {
+			t.Fatal(err)
+		}
+		found = payload.SourceInboxID == "one"
+	}
+	if !found {
+		t.Fatal("backfilled inbox ID missing from delete export")
+	}
+}
+
+func TestPromptInboxIdentityDeletedEnrollmentBackfill(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("enrollment-deleted-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	id, _, err := s.AddPromptWithResult(AddPromptParams{SessionID: "enrollment-deleted-inbox", Project: "engram", Content: "same", SourceInboxID: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePrompt(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnrollProject("engram"); err != nil {
+		t.Fatal(err)
+	}
+	var payloadJSON string
+	err = s.DB().QueryRow(`SELECT payload FROM sync_mutations WHERE entity = ? AND op = ? ORDER BY seq DESC LIMIT 1`, SyncEntityPrompt, SyncOpDelete).Scan(&payloadJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload syncPromptPayload
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.SourceInboxID != "one" {
+		t.Fatalf("backfilled delete inbox ID: %q", payload.SourceInboxID)
+	}
+}
+
+func TestPromptInboxIdentityDeletedLegacyBackupJSON(t *testing.T) {
+	var backup ExportData
+	if err := json.Unmarshal([]byte(fmt.Sprintf(`{"version":%q,"sessions":[],"observations":[],"prompts":[]}`, currentExportVersion)), &backup); err != nil {
+		t.Fatal(err)
+	}
+	if len(backup.PromptTombstones) != 0 {
+		t.Fatalf("unexpected tombstones: %v", backup.PromptTombstones)
+	}
+	s := newTestStore(t)
+	if _, err := s.Import(&backup); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPromptInboxIdentityDeletedLegacyBackup(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("legacy-deleted-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	backup := &ExportData{Version: currentExportVersion, PromptTombstones: []PromptTombstone{{SyncID: "legacy-deleted", SessionID: "legacy-deleted-inbox", DeletedAt: Now()}}}
+	if _, err := s.Import(backup); err != nil {
+		t.Fatal(err)
+	}
+	if _, inserted, err := s.AddPromptWithResult(AddPromptParams{SessionID: "legacy-deleted-inbox", Project: "engram", Content: "new", SourceInboxID: "one"}); err != nil || !inserted {
+		t.Fatalf("legacy tombstone blocks unrelated ID: %v %v", inserted, err)
+	}
+}
+
+func TestPromptInboxIdentityDeletedBackup(t *testing.T) {
+	source := newTestStore(t)
+	if err := source.CreateSession("backup-deleted-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "backup-deleted-inbox", Project: "engram", Content: "same", SourceInboxID: "one"}
+	id, _, err := source.AddPromptWithResult(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.DeletePrompt(id); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := source.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded ExportData
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	restored := newTestStore(t)
+	if _, err := restored.Import(&decoded); err != nil {
+		t.Fatal(err)
+	}
+	if id, inserted, err := restored.AddPromptWithResult(p); !errors.Is(err, ErrPromptInboxDeleted) || id != 0 || inserted {
+		t.Fatalf("restored replay: %d %v %v", id, inserted, err)
+	}
+}
+
 func TestPromptInboxIdentityStoreConcurrentReplay(t *testing.T) {
 	s := newTestStore(t)
 	if err := s.CreateSession("concurrent-inbox", "engram", "/tmp"); err != nil {
