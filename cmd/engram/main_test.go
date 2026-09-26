@@ -1827,7 +1827,9 @@ func TestProjectsMergeDryRunAndApply(t *testing.T) {
 			t.Fatal(err)
 		}
 		source, err := s.PreviewExplicitProjectMerge("acmeapi", "acme-api")
-		s.Close()
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
 		if tc.mode == "--dry-run" && (err != nil || source.ObservationsUpdated != 1) {
 			t.Fatalf("dry-run changed source: %+v %v", source, err)
 		}
@@ -1878,7 +1880,9 @@ func TestProjectsMergeRejectsInvalidPairsWithoutMutation(t *testing.T) {
 				}
 				var count int
 				err = s.DB().QueryRow(`SELECT COUNT(*) FROM observations WHERE project = 'acmeapi'`).Scan(&count)
-				s.Close()
+				if closeErr := s.Close(); closeErr != nil {
+					t.Fatal(closeErr)
+				}
 				if err != nil || count != 1 {
 					t.Fatalf("%s mutated source: count=%d err=%v", mode, count, err)
 				}
@@ -1896,7 +1900,9 @@ func TestProjectsMergeSyncOnly(t *testing.T) {
 	if err := s.EnrollProject("foo-bar"); err != nil {
 		t.Fatal(err)
 	}
-	s.Close()
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct{ mode, want string }{{"--dry-run", "Sync identity changes: true"}, {"--apply", "Sync identity may also change"}} {
 		withArgs(t, "engram", "projects", "merge", "--from", "foo-bar", "--to", "foo_bar", tc.mode)
 		out, stderr := captureOutput(t, func() { cmdProjects(cfg) })
@@ -1912,7 +1918,9 @@ func TestProjectsMergeSyncOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 		target, err := s.IsProjectEnrolled("foo_bar")
-		s.Close()
+		if closeErr := s.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1961,7 +1969,9 @@ func TestProjectsMergeInvalidFlagsDoNotWrite(t *testing.T) {
 			}
 			var count int
 			err = s.DB().QueryRow(`SELECT COUNT(*) FROM observations WHERE project = 'acmeapi'`).Scan(&count)
-			s.Close()
+			if closeErr := s.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
 			if err != nil || count != 1 {
 				t.Fatalf("source mutated: count=%d err=%v", count, err)
 			}

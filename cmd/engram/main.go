@@ -2584,7 +2584,7 @@ func cmdProjectsMerge(cfg store.Config) {
 		fatal(err)
 		return
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }() // Closing the command's store is best effort.
 	// Preview and apply share store eligibility; apply revalidates transactionally.
 	preview, err := s.PreviewExplicitProjectMerge(from, to)
 	if err != nil {

@@ -11681,6 +11681,62 @@ func TestExplicitMergeProjectsSyncOnlySources(t *testing.T) {
 	}
 }
 
+func TestExplicitMergeRejectsReservedInboxWithoutMutation(t *testing.T) {
+	for _, method := range []string{"preview", "explicit", "strict"} {
+		t.Run(method, func(t *testing.T) {
+			s := newTestStore(t)
+			source := "in-box"
+			if method == "strict" {
+				source = "INBOX"
+			}
+			if _, err := s.db.Exec(`INSERT INTO sync_enrolled_projects (project) VALUES (?)`, source); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`INSERT INTO sessions (id, project, directory) VALUES (?, ?, ?)`, "reserved-session", source, "/reserved"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`INSERT INTO sync_mutations (target_key, entity, entity_key, op, payload, source, project) VALUES (?, ?, ?, ?, ?, ?, ?)`, DefaultSyncTargetKey, SyncEntitySession, "reserved-test", SyncOpUpsert, `{"project":"`+source+`"}`, SyncSourceLocal, source); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			switch method {
+			case "preview":
+				_, err = s.PreviewExplicitProjectMerge("in-box", " INBOX ")
+			case "explicit":
+				_, err = s.MergeExplicitProjectVariants([]string{"in-box"}, " INBOX ")
+			case "strict":
+				_, err = s.MergeProjects([]string{"INBOX"}, " INBOX ")
+			}
+			if err == nil || !strings.Contains(err.Error(), "reserved inbox") {
+				t.Fatalf("expected reserved inbox refusal, got %v", err)
+			}
+			for _, check := range []struct {
+				query string
+				args  []any
+				want  int
+			}{
+				{`SELECT COUNT(*) FROM sync_enrolled_projects WHERE project = ?`, []any{source}, 1},
+				{`SELECT COUNT(*) FROM sync_enrolled_projects WHERE project = 'inbox'`, nil, 0},
+				{`SELECT COUNT(*) FROM sync_enrolled_projects`, nil, 1},
+				{`SELECT COUNT(*) FROM sync_mutations WHERE project = ? AND payload = ?`, []any{source, `{"project":"` + source + `"}`}, 1},
+				{`SELECT COUNT(*) FROM sync_mutations`, nil, 1},
+				{`SELECT COUNT(*) FROM sessions WHERE id = 'reserved-session' AND project = ?`, []any{source}, 1},
+				{`SELECT COUNT(*) FROM sessions`, nil, 1},
+				{`SELECT COUNT(*) FROM observations`, nil, 0},
+				{`SELECT COUNT(*) FROM user_prompts`, nil, 0},
+			} {
+				var count int
+				if err := s.db.QueryRow(check.query, check.args...).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != check.want {
+					t.Fatalf("%s: got %d, want %d", check.query, count, check.want)
+				}
+			}
+		})
+	}
+}
+
 func TestMergeProjectsRejectsSeparatorVariants(t *testing.T) {
 	s := newTestStore(t)
 	if _, err := s.MergeProjects([]string{"foo-bar"}, "foo_bar"); err == nil || !strings.Contains(err.Error(), "must normalize") {

@@ -8205,6 +8205,9 @@ type ExplicitProjectMergePreview struct {
 func (s *Store) PreviewExplicitProjectMerge(source, canonical string) (*ExplicitProjectMergePreview, error) {
 	canonical, _ = NormalizeProject(canonical)
 	normalizedSource, _ := NormalizeProject(source)
+	if canonical == ReservedInboxProjectName {
+		return nil, fmt.Errorf("reserved inbox project cannot be a merge destination")
+	}
 	if canonical == "" || normalizedSource == "" || normalizedSource == canonical || !mergeProjectEligible(normalizedSource, canonical, true) {
 		return nil, fmt.Errorf("source project %q must be a distinct separator variant of canonical project %q", source, canonical)
 	}
@@ -8213,7 +8216,7 @@ func (s *Store) PreviewExplicitProjectMerge(source, canonical string) (*Explicit
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }() // Commit makes the deferred rollback a no-op.
 	preview := &ExplicitProjectMergePreview{Canonical: canonical, Source: name}
 	for _, item := range []struct {
 		table string
@@ -8249,6 +8252,9 @@ func (s *Store) mergeProjects(sources []string, canonical string, explicit bool)
 	canonical, _ = NormalizeProject(canonical)
 	if canonical == "" {
 		return nil, fmt.Errorf("canonical project name must not be empty")
+	}
+	if canonical == ReservedInboxProjectName {
+		return nil, fmt.Errorf("reserved inbox project cannot be a merge destination")
 	}
 	validatedSources := make([]string, len(sources))
 	for i, source := range sources {
