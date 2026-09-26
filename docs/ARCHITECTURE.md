@@ -2,6 +2,8 @@
 
 # Architecture
 
+Local `POST /prompts` accepts optional `source_inbox_id` alongside `session_id`, `content`, and `project`. A nonempty ID identifies one prompt within its session: replay returns the existing prompt ID with the same `201` and `{"id":…, "status":"saved"}` response, without another sync mutation or write notification. Distinct IDs may contain identical text. Omitting the ID continues to append a new prompt on every call. Project ownership checks still apply before replay. Sync/import propagation and replay after deletion are not yet supported.
+
 - [How It Works](#how-it-works)
 - [Session Lifecycle](#session-lifecycle)
 - [MCP Tools](#mcp-tools)

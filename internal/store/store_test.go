@@ -765,6 +765,104 @@ func TestAddObservationAdoptsUnownedLegacySessionProject(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityStore(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("inbox-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	p := AddPromptParams{SessionID: "inbox-session", Project: "engram", Content: "same", SourceInboxID: "inbox-1"}
+	first, inserted, err := s.AddPromptWithResult(p)
+	if err != nil || !inserted {
+		t.Fatalf("first: %d %v %v", first, inserted, err)
+	}
+	var before int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	again, inserted, err := s.AddPromptWithResult(p)
+	if err != nil || inserted || again != first {
+		t.Fatalf("replay: %d %v %v", again, inserted, err)
+	}
+	var after int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations`).Scan(&after); err != nil || after != before {
+		t.Fatalf("mutations: %d -> %d: %v", before, after, err)
+	}
+	if err := s.CreateSession("other-session", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	other := p
+	other.SessionID = "other-session"
+	otherID, otherInserted, err := s.AddPromptWithResult(other)
+	if err != nil || !otherInserted || otherID == first {
+		t.Fatalf("same inbox ID in another session: %d %v %v", otherID, otherInserted, err)
+	}
+	p.SourceInboxID = "inbox-2"
+	second, inserted, err := s.AddPromptWithResult(p)
+	if err != nil || !inserted || second == first {
+		t.Fatalf("distinct: %d %v %v", second, inserted, err)
+	}
+	p.SourceInboxID = ""
+	third, err := s.AddPrompt(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourth, err := s.AddPrompt(p)
+	if err != nil || fourth == third {
+		t.Fatalf("legacy: %d %d %v", third, fourth, err)
+	}
+}
+
+func TestPromptInboxIdentityStoreConcurrentReplay(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.CreateSession("concurrent-inbox", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	enrollTestProject(t, s, "engram")
+	const workers = 12
+	start := make(chan struct{})
+	type result struct {
+		id       int64
+		inserted bool
+		err      error
+	}
+	results := make(chan result, workers)
+	p := AddPromptParams{SessionID: "concurrent-inbox", Project: "engram", Content: "same", SourceInboxID: "shared"}
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			id, inserted, err := s.AddPromptWithResult(p)
+			results <- result{id, inserted, err}
+		}()
+	}
+	close(start)
+	var first int64
+	var inserts int
+	for i := 0; i < workers; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if first == 0 {
+			first = r.id
+		} else if r.id != first {
+			t.Fatalf("concurrent replay returned %d, want %d", r.id, first)
+		}
+		if r.inserted {
+			inserts++
+		}
+	}
+	if inserts != 1 {
+		t.Fatalf("inserted %d times, want one", inserts)
+	}
+	var mutations int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM sync_mutations WHERE entity = 'prompt'`).Scan(&mutations); err != nil {
+		t.Fatal(err)
+	}
+	if mutations != 1 {
+		t.Fatalf("prompt sync mutations = %d, want one", mutations)
+	}
+}
+
 func TestAddPromptAdoptsUnownedLegacySessionProject(t *testing.T) {
 	type legacySession struct{ id, project string }
 	s := newTestStoreWithNullableLegacySessions(t, legacySession{"null-session", "<NULL>"})

@@ -2088,6 +2088,35 @@ func TestSyncStatusResolvesProjectSelectors(t *testing.T) {
 	}
 }
 
+func TestPromptInboxIdentityHTTP(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+	var writes atomic.Int32
+	srv.SetOnWrite(func() { writes.Add(1) })
+	if err := st.CreateSession("inbox-http", "engram", "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	request := func(body string) (int, string) {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/prompts", strings.NewReader(body)))
+		return rec.Code, rec.Body.String()
+	}
+	payload := `{"session_id":"inbox-http","project":"engram","content":"same","source_inbox_id":"a"}`
+	code, first := request(payload)
+	if code != http.StatusCreated || writes.Load() != 1 {
+		t.Fatalf("first: %d %s writes=%d", code, first, writes.Load())
+	}
+	code, replay := request(payload)
+	if code != http.StatusCreated || replay != first || writes.Load() != 1 {
+		t.Fatalf("replay: %d %s writes=%d", code, replay, writes.Load())
+	}
+	code, _ = request(`{"session_id":"inbox-http","project":"other","content":"same","source_inbox_id":"a"}`)
+	if code == http.StatusCreated || writes.Load() != 1 {
+		t.Fatalf("wrong project: %d writes=%d", code, writes.Load())
+	}
+}
+
 // ─── OnWrite Notification Tests ──────────────────────────────────────────────
 
 func TestOnWriteCalledAfterSuccessfulWrites(t *testing.T) {
