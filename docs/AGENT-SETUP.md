@@ -56,22 +56,24 @@ marketplace plugin, it warns without changing the selected mode; session-only
 
 ## Pi
 
-Install Engram's Pi-native package and retain the MCP adapter for other servers:
+> **Publication prerequisite:** This branch prepares setup for `gentle-engram@0.1.17`. Do not integrate it or run the commands below until `0.1.17` is published on npm. The latest observed published version is `0.1.16`; the unchanged prepublication release gate intentionally rejects this branch.
+
+Install Engram's Pi-native package and retain the MCP adapter for other servers after publication:
 
 ```bash
 engram setup pi
 ```
 
-`engram setup pi` runs `pi install npm:gentle-engram@0.1.16` and `pi install npm:pi-mcp-adapter`, then ensures Pi settings contain both packages. Pi agent writes use native `mem_*` tools, not Engram MCP registration. `engram setup pi` does not create or change `mcpServers.engram`. Go setup remains pinned to published `0.1.16`. That version's `pi-engram init` still registers Engram MCP and must not be used for native-only setup. If `gentle-engram@0.1.17` is available on npm, install it explicitly and run `pi-engram init` for native-only setup; version `0.1.17` init does not create or change `mcp.json` and warns about an existing `mcpServers.engram` entry. If the Pi agent directory's `mcp.json` already contains `mcpServers.engram`, Go setup warns with its exact path and key; manually remove only that key and restart/reload Pi for the native-only guarantee. Until then native-only agent writes are **not guaranteed**. Other MCP servers are preserved.
+This branch's `engram setup pi` runs `pi install npm:gentle-engram@0.1.17` and `pi install npm:pi-mcp-adapter`, then ensures Pi settings contain both packages. Pi agent writes use native `mem_*` tools, not Engram MCP registration. `engram setup pi` does not create or change `mcpServers.engram`. Published `0.1.16`'s `pi-engram init` still registers Engram MCP and must not be used for native-only setup. After npm publication, version `0.1.17` init does not create or change `mcp.json` and warns about an existing `mcpServers.engram` entry. If the Pi agent directory's `mcp.json` already contains `mcpServers.engram`, Go setup warns with its exact path and key; manually remove only that key and restart/reload Pi for the native-only guarantee. Until then native-only agent writes are **not guaranteed**. Other MCP servers are preserved.
 
 For versioned mise installations, setup selects the shim directory from an absolute `MISE_SHIMS_DIR`, the effective absolute `shims_dir` reported by `mise settings get shims_dir` (including global config), or the mise data directory's default `shims` folder, in that order. Invalid settings output or an unavailable mise CLI leaves the default directory as the fallback. If the shim is missing from the selected directory, the caller uses its existing executable/PATH fallback policy; setup never writes mise warnings as the Engram MCP command.
 
 When [mise](https://mise.jdx.dev/) is detected in `PATH`, `engram setup pi` also auto-pins `npmCommand` in Pi's `settings.json` to `["mise", "exec", "node@<version>", "--", "npm"]`, preventing Node version drift from silently changing which npm root Pi uses. If `npmCommand` already exists in `settings.json`, the existing value is preserved. This step is a no-op when mise is not installed.
 
-Manual equivalent:
+Manual equivalent (after publication):
 
 ```bash
-pi install npm:gentle-engram@0.1.16
+pi install npm:gentle-engram@0.1.17
 pi install npm:pi-mcp-adapter
 ```
 

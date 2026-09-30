@@ -77,13 +77,15 @@ Engram includes a terminal UI for browsing sessions, observations, prompts, proj
 
 ## Quick start
 
+> **Publication prerequisite:** This branch prepares the Go installer pin for `gentle-engram@0.1.17`. Do not integrate it or run this quick start until `0.1.17` is published on npm. The latest observed published version is `0.1.16`; the unchanged prepublication release gate intentionally rejects this branch.
+
 ```bash
 pi install npm:gentle-engram@0.1.17
 pi install npm:pi-mcp-adapter
 pi-engram init
 ```
 
-Use this quick start if `gentle-engram@0.1.17` is available on npm; otherwise wait for its publication before running these commands for native-only setup. Published `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup. Go's `engram setup pi` remains pinned to `0.1.16` pending a separate pin update.
+Use this quick start if `gentle-engram@0.1.17` is available on npm; otherwise wait for its publication before running these commands for native-only setup. Published `0.1.16` still registers Engram MCP during `pi-engram init`, so do not use it for native-only setup. This branch's `engram setup pi` pins `0.1.17` for use after publication; it still preserves existing MCP configuration.
 
 Restart Pi after installation, then ask Pi what it remembers about the current project or call `mem_context`.
 

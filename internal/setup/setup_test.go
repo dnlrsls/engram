@@ -760,7 +760,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if result.Agent != "pi" || result.Destination != agentDir || result.Files != 1 {
 		t.Fatalf("unexpected install result: %#v", result)
 	}
-	wantCommands := []string{"pi install npm:gentle-engram@0.1.16", "pi install npm:pi-mcp-adapter"}
+	wantCommands := []string{"pi install npm:gentle-engram@0.1.17", "pi install npm:pi-mcp-adapter"}
 	if !reflect.DeepEqual(commands, wantCommands) {
 		t.Fatalf("unexpected pi install commands: got %#v want %#v", commands, wantCommands)
 	}
@@ -775,7 +775,7 @@ func TestInstallPiInstallsPackagesAndWritesConfig(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings: %v", err)
 	}
-	for _, pkg := range []string{"npm:gentle-engram@0.1.16", "npm:pi-mcp-adapter"} {
+	for _, pkg := range []string{"npm:gentle-engram@0.1.17", "npm:pi-mcp-adapter"} {
 		if !slices.Contains(settings.Packages, pkg) {
 			t.Fatalf("expected settings packages to include %q, got %#v", pkg, settings.Packages)
 		}
@@ -798,7 +798,7 @@ func TestInstallPiPreservesExistingEngramMCPServer(t *testing.T) {
 	if err := os.MkdirAll(agentDir, 0755); err != nil {
 		t.Fatalf("mkdir agent dir: %v", err)
 	}
-	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.1.11","npm:pi-mcp-adapter"]}`), 0644); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.16","npm:pi-mcp-adapter"]}`), 0644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 	originalMCP := `{"mcpServers":{"engram":{"command":"custom-engram","args":["mcp"],"lifecycle":"eager"},"other":{"command":"other"}}}`
@@ -831,7 +831,7 @@ func TestInstallPiPreservesExistingEngramMCPServer(t *testing.T) {
 	if err := json.Unmarshal(settingsRaw, &settings); err != nil {
 		t.Fatalf("parse settings after install: %v", err)
 	}
-	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.1.16"}
+	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.1.17"}
 	if !reflect.DeepEqual(settings.Packages, wantPackages) {
 		t.Fatalf("expected settings packages to preserve unrelated entries and migrate legacy pins: got %#v want %#v", settings.Packages, wantPackages)
 	}
@@ -906,7 +906,7 @@ func TestWarnPiMCPConfigRejectsMalformedConfig(t *testing.T) {
 func TestEnsurePiPackageSettingsMigratesLegacyPackageIdempotently(t *testing.T) {
 	resetSetupSeams(t)
 	settingsPath := filepath.Join(t.TempDir(), "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.1.15","npm:gentle-engram@0.1.8","npm:pi-mcp-adapter"]}`), 0644); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"packages":["npm:existing","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.11","npm:gentle-engram@0.1.12","npm:gentle-engram@0.1.14","npm:gentle-engram@0.1.15","npm:gentle-engram@0.1.8","npm:gentle-engram@0.1.16","npm:gentle-engram@0.1.16","npm:pi-mcp-adapter"]}`), 0644); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 
@@ -928,7 +928,7 @@ func TestEnsurePiPackageSettingsMigratesLegacyPackageIdempotently(t *testing.T) 
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatalf("parse migrated settings: %v", err)
 	}
-	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.1.16"}
+	wantPackages := []string{"npm:existing", "npm:pi-mcp-adapter", "npm:gentle-engram@0.1.17"}
 	if !reflect.DeepEqual(settings.Packages, wantPackages) {
 		t.Fatalf("unexpected migrated packages: got %#v want %#v", settings.Packages, wantPackages)
 	}
@@ -948,7 +948,7 @@ func TestInstallPiCommandFailure(t *testing.T) {
 		return []byte("boom"), errors.New("exit 1")
 	}
 	_, err := Install("pi")
-	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.1.16") {
+	if err == nil || !strings.Contains(err.Error(), "install npm:gentle-engram@0.1.17") {
 		t.Fatalf("expected pi install error, got %v", err)
 	}
 }
