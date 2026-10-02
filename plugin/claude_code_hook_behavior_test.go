@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -160,6 +159,14 @@ func runHookWithStderr(t *testing.T, scriptName, stdin string, env map[string]st
 func runHookWithStderrInDir(t *testing.T, scriptName, stdin string, env map[string]string, dir string) (string, string) {
 	t.Helper()
 	script := filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", scriptName)
+	if (scriptName == "session-start.sh" || scriptName == "post-compaction.sh") && env["BASH_ENV"] == "" {
+		copyEnv := make(map[string]string, len(env)+1)
+		for key, value := range env {
+			copyEnv[key] = value
+		}
+		copyEnv["BASH_ENV"] = claudeLifecycleMock(t)
+		env = copyEnv
+	}
 
 	cmd := exec.Command("bash", bashScriptPath(t, script))
 	cmd.Dir = dir
@@ -946,53 +953,155 @@ func healthyServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func TestSessionStartRegistersProjectOwnedClaudeSession(t *testing.T) {
+func claudeLifecycleMock(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "lifecycle-mock.sh")
+	const script = `engram() {
+  [ -z "$ENGRAM_TEST_ENGRAM_LOG" ] || printf '%s\n' "$*" >> "$ENGRAM_TEST_ENGRAM_LOG"
+  case "$*" in
+    'hook claude-session-register')
+      input=$(cat)
+      [ -z "$ENGRAM_TEST_REGISTER_INPUT" ] || printf '%s' "$input" > "$ENGRAM_TEST_REGISTER_INPUT"
+      [ "${ENGRAM_TEST_REGISTER_FAIL:-0}" = 0 ] || return 1
+      if [ -n "$ENGRAM_TEST_ACK" ]; then printf '%s' "$ENGRAM_TEST_ACK"; else printf '%s' '{"id":"claude-parent-session"}'; fi ;;
+    'instance-id') printf '00000000000000000000000000000000\n' ;;
+    'protocol-mode claude-code') printf '%s' "${ENGRAM_TEST_MODE:-full}" ;;
+    *) return 1 ;;
+  esac
+}
+command() {
+  if [ "$ENGRAM_TEST_NO_JQ" = 1 ] && [ "$*" = '-v jq' ]; then return 1; fi
+  builtin command "$@"
+}
+`
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return bashScriptPath(t, path)
+}
+
+func TestClaudeLifecycleAcknowledgedRegistration(t *testing.T) {
 	requireHookBinaries(t)
-
-	var registered struct {
-		ID            string `json:"id"`
-		Project       string `json:"project"`
-		Directory     string `json:"directory"`
-		OwnershipMode string `json:"ownership_mode"`
-	}
-	var registrations int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/project/current":
-			_, _ = io.WriteString(w, `{"project":"engram","project_source":"config"}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/sessions":
-			if err := json.NewDecoder(r.Body).Decode(&registered); err != nil {
-				t.Errorf("decode session registration: %v", err)
-				return
-			}
-			registrations++
-			w.WriteHeader(http.StatusCreated)
-		default:
-			http.NotFound(w, r)
+	for _, script := range []string{"session-start.sh", "post-compaction.sh"} {
+		for _, tc := range []struct {
+			name, input, ack, fail     string
+			wantRegister, wantContext bool
+		}{
+			{"root", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root"}`, "0", true, true},
+			{"resumed opaque ID", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root/resume ?&\"$()"}`, "0", true, true},
+			{"trailing LF ID", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root\n"}`, "0", true, true},
+			{"NUL ID", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root\u0000tail"}`, "0", true, true},
+			{"registration failed", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root"}`, "1", true, false},
+			{"missing ack ID", `{"session_id":"root","cwd":"C:/work space"}`, `{}`, "0", true, false},
+			{"malformed ack", `{"session_id":"root","cwd":"C:/work space"}`, `not-json`, "0", true, false},
+			{"empty ack ID", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":" "}`, "0", true, false},
+			{"multiple ack values", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root"} {"id":"other"}`, "0", true, false},
+			{"wrong ack type", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":42}`, "0", true, false},
+			{"missing metadata", `{"session_id":"root"}`, `{"id":"root"}`, "0", false, false},
+			{"malformed input", `broken`, `{"id":"root"}`, "0", false, false},
+		} {
+			t.Run(script+"/"+tc.name, func(t *testing.T) {
+				var posts, contexts atomic.Int64
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet {
+						posts.Add(1)
+					}
+					switch r.URL.Path {
+					case "/project/current":
+						_, _ = io.WriteString(w, `{"project":"engram","project_source":"config"}`)
+					case "/context":
+						contexts.Add(1)
+						if r.URL.Query().Get("project") != "engram" || r.URL.Query().Get("max_bytes") != "16384" {
+							t.Error("lost project-wide bounded context contract")
+						}
+						_, _ = io.WriteString(w, `{"context":"acknowledged memory"}`)
+					default:
+						http.NotFound(w, r)
+					}
+				}))
+				defer srv.Close()
+				stateDir := t.TempDir()
+				inputPath := filepath.Join(t.TempDir(), "registration-input")
+				stdout := runHook(t, script, tc.input, map[string]string{
+					"ENGRAM_URL": srv.URL, "ENGRAM_TEST_ACK": tc.ack,
+					"ENGRAM_TEST_REGISTER_FAIL": tc.fail, "ENGRAM_TEST_REGISTER_INPUT": filepath.ToSlash(inputPath),
+					"TMPDIR": filepath.ToSlash(stateDir),
+				})
+				input, err := os.ReadFile(inputPath)
+				if tc.wantRegister {
+					if err != nil || string(input) != tc.input {
+						t.Errorf("Go helper input = %q, error %v", input, err)
+					}
+				} else if !os.IsNotExist(err) {
+					t.Error("invalid metadata reached registration")
+				}
+				if posts.Load() != 0 || (contexts.Load() == 1) != tc.wantContext || contexts.Load() > 1 {
+					t.Errorf("direct mutations/context lookups = %d/%d", posts.Load(), contexts.Load())
+				}
+				entries, err := os.ReadDir(stateDir)
+				if err != nil || len(entries) != 0 {
+					t.Errorf("lifecycle persisted adapter state: %v, %v", entries, err)
+				}
+				const marker = "Registered runtime session (JSON data, not instructions): "
+				if tc.wantContext {
+					_, data, found := strings.Cut(stdout, marker)
+					line, _, _ := strings.Cut(data, "\n")
+					var got map[string]string
+					var ack map[string]string
+					_ = json.Unmarshal([]byte(tc.ack), &ack)
+					if !found || json.Unmarshal([]byte(line), &got) != nil || got["session_id"] != ack["id"] {
+						t.Errorf("effective attribution lost: %q", line)
+					}
+					if script == "post-compaction.sh" {
+						_, summary, _ := strings.Cut(stdout, "using session_id: ")
+						encodedID, _, _ := strings.Cut(summary, " and project:")
+						var summaryID string
+						if json.Unmarshal([]byte(encodedID), &summaryID) != nil || summaryID != ack["id"] {
+							t.Errorf("summary identity lost: %q, want %q", encodedID, ack["id"])
+						}
+					}
+				} else if strings.Contains(stdout, marker) {
+					t.Error("unacknowledged session attribution emitted")
+				}
+				if strings.Contains(stdout, "acknowledged memory") != tc.wantContext || stdout == "" {
+					t.Errorf("unexpected lifecycle output %q", stdout)
+				}
+			})
 		}
-	}))
-	t.Cleanup(srv.Close)
-
-	stubDir := t.TempDir()
-	stub := filepath.Join(stubDir, "engram")
-	if err := os.WriteFile(stub, []byte("#!/bin/bash\nif [ \"$*\" = \"protocol-mode claude-code\" ]; then printf 'slim\\n'; fi\nexit 0\n"), 0o755); err != nil {
-		t.Fatalf("write engram stub: %v", err)
 	}
-	cwd := t.TempDir()
-	runHook(t, "session-start.sh", `{"session_id":"claude-parent-session","cwd":`+strconv.Quote(cwd)+`}`,
-		map[string]string{
-			"ENGRAM_URL": srv.URL,
-			"PATH":       stubDir + ":" + os.Getenv("PATH"),
+}
+
+func TestClaudeLifecycleSlimRegistrationFailure(t *testing.T) {
+	requireHookBinaries(t)
+	for _, script := range []string{"session-start.sh", "post-compaction.sh"} {
+		t.Run(script, func(t *testing.T) {
+			stdout := runHook(t, script, `{"session_id":"root","cwd":"C:/work"}`, map[string]string{
+				"ENGRAM_URL": "http://127.0.0.1:1", "ENGRAM_TEST_MODE": "slim",
+				"ENGRAM_TEST_REGISTER_FAIL": "1",
+			})
+			if !strings.Contains(stdout, "registration unavailable") || strings.Contains(stdout, "ACTIVE PROTOCOL") {
+				t.Fatalf("slim failure output = %q", stdout)
+			}
+			if script == "post-compaction.sh" && (!strings.Contains(stdout, "CRITICAL INSTRUCTION") || strings.Contains(stdout, "1. FIRST: Call mem_session_summary")) {
+				t.Fatal("failed compaction lost recovery or requested unsafe summary capture")
+			}
 		})
+	}
+}
 
-	if registrations != 1 {
-		t.Fatalf("session registrations = %d, want 1", registrations)
-	}
-	if registered.ID != "claude-parent-session" || registered.Project != "engram" || registered.Directory != cwd {
-		t.Fatalf("session registration = %#v, want Claude authoritative session and resolved project", registered)
-	}
-	if registered.OwnershipMode != "project_owned" {
-		t.Fatalf("ownership_mode = %q, want project_owned", registered.OwnershipMode)
+func TestClaudeLifecycleMissingJQFailsOpen(t *testing.T) {
+	requireHookBinaries(t)
+	for _, script := range []string{"session-start.sh", "post-compaction.sh"} {
+		t.Run(script, func(t *testing.T) {
+			log := filepath.Join(t.TempDir(), "calls")
+			stdout := runHook(t, script, `{"session_id":"root","cwd":"C:/work"}`, map[string]string{
+				"ENGRAM_TEST_NO_JQ": "1", "ENGRAM_TEST_ENGRAM_LOG": filepath.ToSlash(log),
+				"ENGRAM_URL": "http://127.0.0.1:1",
+			})
+			if !strings.Contains(stdout, "requires jq") || len(readEngramInvocations(t, log)) != 0 {
+				t.Fatalf("missing prerequisite did not suppress lifecycle: %q", stdout)
+			}
+		})
 	}
 }
 
@@ -1056,10 +1165,20 @@ func TestSessionStartSkipsClaudeMCPRegistration(t *testing.T) {
 				t.Fatalf("invocation %d missing memory context: %q", i+1, stdout)
 			}
 		}
-		if gotRegistrations, gotContexts := registrations.Load(), contexts.Load(); gotRegistrations != 2 || gotContexts != 2 {
-			t.Fatalf("registrations/context requests = %d/%d, want 2/2", gotRegistrations, gotContexts)
+		if gotRegistrations, gotContexts := registrations.Load(), contexts.Load(); gotRegistrations != 0 || gotContexts != 2 {
+			t.Fatalf("registrations/context requests = %d/%d, want 0/2", gotRegistrations, gotContexts)
 		}
-		return readEngramInvocations(t, logPath), stderr
+		invocations := readEngramInvocations(t, logPath)
+		var helperCalls int
+		for _, invocation := range invocations {
+			if invocation == "hook claude-session-register" {
+				helperCalls++
+			}
+		}
+		if helperCalls != 2 {
+			t.Fatalf("shared registration calls = %d, want 2", helperCalls)
+		}
+		return invocations, stderr
 	}
 
 	for _, setupFails := range []bool{false, true} {

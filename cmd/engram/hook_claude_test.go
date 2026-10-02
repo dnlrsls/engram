@@ -41,6 +41,16 @@ func claudeHookStdin(t *testing.T, input string, closed bool) *os.File {
 	return reader
 }
 
+// The test executable provides a deterministic process boundary for the shell;
+// it runs the existing Go dispatch against the fixture server, never installed Engram.
+func TestClaudeLifecycleRegistrationProcess(t *testing.T) {
+	if os.Getenv("ENGRAM_TEST_CLAUDE_REGISTER_PROCESS") != "1" {
+		return
+	}
+	cmdHook([]string{"claude-session-register"})
+	os.Exit(0)
+}
+
 func TestClaudeEndedRegistrationCannotPersistBoundWrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes the Claude SessionStart bash hook")
@@ -104,20 +114,35 @@ func TestClaudeEndedRegistrationCannotPersistBoundWrite(t *testing.T) {
 	if err := os.Mkdir(stubDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	stub := "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1\" = setup ] && [ \"$2\" = claude-code ] && [ \"$3\" = --mcp-only ]; then exit 0; fi\nprintf 'unexpected engram invocation\\n' >&2\nexit 99\n"
-	if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte(stub), 0700); err != nil {
+	// The shell consumes the Go helper failure, not a direct registration POST.
+	// BASH_ENV intercepts every Engram invocation even under Windows Bash PATH.
+	bashEnv := filepath.Join(stubDir, "engram-mock.sh")
+	stub := `engram() {
+  if [ "$*" = 'hook claude-session-register' ]; then
+    input=$(cat)
+    printf '%s' "$input" > "$ENGRAM_TEST_REGISTER_INPUT"
+  fi
+  return 1
+}
+`
+	if err := os.WriteFile(bashEnv, []byte(stub), 0600); err != nil {
 		t.Fatal(err)
 	}
+	registerInput := filepath.Join(root, "register-input")
 	input, _ := json.Marshal(map[string]string{"session_id": host, "cwd": root})
 	cmd := exec.Command("bash", filepath.Join("..", "..", "plugin", "claude-code", "scripts", "session-start.sh"))
 	cmd.Stdin = strings.NewReader(string(input))
-	cmd.Env = append(os.Environ(), "PATH="+stubDir+string(os.PathListSeparator)+os.Getenv("PATH"), "HOME="+root, "CLAUDE_CONFIG_DIR="+filepath.Join(root, "claude"), "ENGRAM_DATA_DIR="+filepath.Join(root, "data"), "ENGRAM_URL="+server.URL, "ENGRAM_SOCKET=", "ENGRAM_PROJECT=", "ENGRAM_PORT=")
+	cmd.Env = append(os.Environ(), "BASH_ENV="+filepath.ToSlash(bashEnv), "ENGRAM_TEST_REGISTER_INPUT="+filepath.ToSlash(registerInput), "HOME="+root, "CLAUDE_CONFIG_DIR="+filepath.Join(root, "claude"), "ENGRAM_DATA_DIR="+filepath.Join(root, "data"), "ENGRAM_URL="+server.URL, "ENGRAM_SOCKET=", "ENGRAM_PROJECT=", "ENGRAM_PORT=")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("SessionStart: %v: %s", err, out)
 	}
-	if registrationStatus != http.StatusConflict {
-		t.Fatalf("registration status = %d, want 409; hook output: %s", registrationStatus, out)
+	if registrationStatus != 0 || !strings.Contains(string(out), "registration unavailable") {
+		t.Fatalf("shell bypassed shared registration failure: status %d, output %s", registrationStatus, out)
+	}
+	registeredInput, err := os.ReadFile(registerInput)
+	if err != nil || string(registeredInput) != string(input) {
+		t.Fatalf("native metadata not forwarded to helper: %q, %v", registeredInput, err)
 	}
 	request, _ := json.Marshal(map[string]any{"session_id": host, "cwd": root, "tool_name": "mcp__engram__mem_save", "tool_input": map[string]any{"title": "ended host write", "content": "must not persist", "session_id": "foreign-model-session", "project": "project-a"}})
 	var hook struct {
@@ -986,10 +1011,21 @@ func TestClaudeShellLifecyclePersistsOnlyLiveHostWrites(t *testing.T) {
 	if err := os.Mkdir(stubDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	stub := "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1\" = setup ] && [ \"$2\" = claude-code ] && [ \"$3\" = --mcp-only ]; then exit 0; fi\nexit 99\n"
-	if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte(stub), 0700); err != nil {
+	bashEnv := filepath.Join(stubDir, "engram-mock.sh")
+	stub := `engram() {
+  [ "$*" = 'hook claude-session-register' ] || return 1
+  ENGRAM_TEST_CLAUDE_REGISTER_PROCESS=1 "$ENGRAM_TEST_EXECUTABLE" -test.run '^TestClaudeLifecycleRegistrationProcess$'
+}
+`
+	if err := os.WriteFile(bashEnv, []byte(stub), 0600); err != nil {
 		t.Fatal(err)
 	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BASH_ENV", filepath.ToSlash(bashEnv))
+	t.Setenv("ENGRAM_TEST_EXECUTABLE", filepath.ToSlash(executable))
 	t.Setenv("ENGRAM_URL", endpoint.URL)
 	t.Setenv("HOME", root)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "claude"))
@@ -1066,7 +1102,7 @@ func TestClaudeShellLifecyclePersistsOnlyLiveHostWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	start(endedHost)
-	if registered, conflicted := registrations.Load(), conflicts.Load(); registered != 7 || conflicted != 1 {
+	if registered, conflicted := registrations.Load(), conflicts.Load(); registered != 7 || conflicted != 0 {
 		t.Fatalf("registrations = %d, production 409s = %d", registered, conflicted)
 	}
 	decision, bound := preToolUse(endedHost, "must not persist")

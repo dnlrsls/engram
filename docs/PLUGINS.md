@@ -155,25 +155,27 @@ plugin/claude-code/
 3. Claude model `mem_session_end` calls are denied without contacting the server: host lifecycle owns session closure. This prevents repeated model end calls from registering accidental continuations.
 4. The rewrite uses `updatedInput`; it does not auto-approve a permission decision.
 
-`engram hook claude-session-register` reads native Claude hook JSON containing nonblank `session_id` and `cwd` from stdin. It resolves project authority and registers within a 1.5-second network deadline, then emits only `{ "id": "<effective Engram ID>" }`. Failure exits nonzero without emitting a fabricated ID. A `201` created acknowledgement must identify the host ID or explicitly name that host in `resumed_from` for a differing ID; suffixes are never guessed and no local mapping is stored. This Go helper and guard support resume binding; the shell lifecycle/prompt hooks have not yet been migrated to consume it.
+`engram hook claude-session-register` reads native Claude hook JSON containing nonblank `session_id` and `cwd` from stdin. It resolves project authority and registers within a 1.5-second network deadline, then emits only `{ "id": "<effective Engram ID>" }`. Failure exits nonzero without emitting a fabricated ID. A `201` created acknowledgement must identify the host ID or explicitly name that host in `resumed_from` for a differing ID; suffixes are never guessed and no local mapping is stored. The guard, Bash startup and compaction hooks consume this shared registration contract; Bash/PowerShell prompt attribution remains pending.
 
 Session binding is best-effort if the host times out the PreToolUse hook: normal permission flow can continue without the rewrite, so an explicit wrong same-project session ID might be persisted. This limitation was reproduced with an induced one-second hook timeout in a scratch test; it has not been observed with the production hook timeout.
 
 **On host session end** (`SessionEnd`):
 `session-end.sh` forwards native hook JSON to `engram hook claude-session-end`. Go requires nonblank host `session_id` and `cwd`, resolves trustworthy project authority, and canonicalizes the runtime directory with the same resolver used by registration. It calls `POST /sessions/{host}/end` with `effective_continuation: true` and `ownership_mode: "project_owned"`. The server closes only an existing owned live root/continuation; repeated end never registers, creates, or reopens a session. Missing/unsafe metadata prevents a close request. Network operations share a 1.5-second deadline; the shell remains silent and fail-open if resolution, transport, ownership checks, or the command fail (including older binaries). No ID mapping is stored. Model `mem_session_end` remains denied before network access.
 
-Startup, compaction and prompt hooks still use their previous registration/attribution paths; their effective-ID migration is pending. Host closure support alone does not complete resume continuity.
+Prompt hooks still use their previous attribution paths, so resume continuity is not yet complete. Host-close response validation also remains limited: redirects and loose 2xx/JSON acceptance are an unresolved follow-up. The previous full plugin suite failed a Codex stdin-marker test whose original failure causality is unknown; focused Claude success does not establish full-suite success. Linux socket/executable E2E coverage remains outstanding.
 
 **On session start** (`startup`):
 1. Ensures the engram HTTP server is running
-2. Creates a new session via the API
+2. Calls `engram hook claude-session-register` with native stdin metadata; Go registers or resumes the owned session
 3. Auto-imports git-synced chunks from `.engram/manifest.json` (if present)
-4. Injects previous session context into Claude's initial context
+4. Emits the acknowledged effective `session_id` as JSON data and injects bounded **project-wide** context (not a session-filtered lookup) only after successful registration
 
 **On compaction** (`compact`):
-1. Injects the previous session context + compacted summary
-2. Tells the agent: "FIRST ACTION REQUIRED — call `mem_session_summary` with this content before doing anything else"
-3. This ensures no work is lost when context is compressed
+1. Uses the same shared registration and bounded project-wide context flow as startup
+2. Directs `mem_session_summary` to the acknowledged effective ID; failed registration suppresses context injection and instructs the agent not to guess an ID or capture a session summary
+3. Retains recovery instructions and the full/slim protocol policy; no local ID map, host-ID fallback, or direct shell registration is used
+
+These Bash lifecycle hooks require runnable Bash, jq, curl and an Engram binary supporting the registration helper. Missing jq reports unavailable memory without blocking Claude; an unavailable/older helper or malformed acknowledgement suppresses session attribution and context injection. Git Bash paths and JSON IDs are passed as data, not evaluated shell commands. Acknowledged IDs remain compact JSON strings in Bash and summary instructions, preserving trailing line feeds and escaped NUL exactly. Startup never performs MCP setup or edits Claude configuration. Prompt-specific Windows safe mode and PowerShell fallback behavior are unchanged.
 
 **On user prompt submit**:
 1. The first prompt injects a ToolSearch instruction so Claude Code loads Engram MCP tools before responding.
