@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/Gentleman-Programming/engram/v3/internal/mcp"
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
 	"github.com/Gentleman-Programming/engram/v3/internal/server"
 	"github.com/Gentleman-Programming/engram/v3/internal/store"
 )
@@ -544,6 +545,148 @@ func TestClaudeResumeBinding(t *testing.T) {
 	}
 	if response, err := registerClaudeHookInput(input); err == nil || response != nil {
 		t.Fatalf("foreign continuation allowed: %s %v", response, err)
+	}
+}
+
+func TestClaudeHostEnd(t *testing.T) {
+	root := t.TempDir()
+	for _, authority := range []string{`{"project":"project-a","project_source":"config"}`, `{}`, `{"project":"project-a","project_source":"config","error_hint":"unsafe"}`} {
+		t.Run(authority, func(t *testing.T) {
+			closes := 0
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/project/current" {
+					_, _ = io.WriteString(w, authority)
+					return
+				}
+				if r.Method != http.MethodPost || r.URL.EscapedPath() != "/sessions/host%2Fid/end" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				if body["effective_continuation"] != true || body["ownership_mode"] != "project_owned" || body["project"] != "project-a" || body["directory"] != projectpkg.RuntimeWorktreeDirectory(root) {
+					t.Errorf("unsafe close body: %v", body)
+				}
+				closes++
+				_, _ = io.WriteString(w, `{"status":"completed"}`)
+			}))
+			defer endpoint.Close()
+			t.Setenv("ENGRAM_URL", endpoint.URL)
+			input, _ := json.Marshal(map[string]string{"session_id": "host/id", "cwd": root})
+			for i := 0; i < 2; i++ {
+				err := endClaudeHookInput(input)
+				if (err == nil) != (authority == `{"project":"project-a","project_source":"config"}`) {
+					t.Fatalf("close error: %v", err)
+				}
+			}
+			want := 0
+			if authority == `{"project":"project-a","project_source":"config"}` {
+				want = 2
+			}
+			if closes != want {
+				t.Fatalf("closes=%d want=%d", closes, want)
+			}
+		})
+	}
+}
+
+func TestClaudeHostEndClosesExistingContinuationOnly(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.New(store.FallbackConfig(filepath.Join(root, "store")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if err := db.StartSessionWithOwnershipMode("host", "project-a", projectpkg.RuntimeWorktreeDirectory(root), store.SessionOwnershipProjectOwned); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EndSession("host", "finished"); err != nil {
+		t.Fatal(err)
+	}
+	effective, err := db.ResumeSessionWithOwnershipMode("host", "project-a", projectpkg.RuntimeWorktreeDirectory(root), store.SessionOwnershipProjectOwned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	production := server.New(db, 0).Handler()
+	authority := "foreign"
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/project/current" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"project": authority, "project_source": "config"})
+			return
+		}
+		if r.URL.Path == "/sessions" {
+			t.Error("host end attempted registration")
+		}
+		production.ServeHTTP(w, r)
+	}))
+	defer endpoint.Close()
+	t.Setenv("ENGRAM_URL", endpoint.URL)
+	input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": root})
+	if err := endClaudeHookInput(input); err == nil {
+		t.Fatal("foreign project closed continuation")
+	}
+	authority = "project-a"
+	// Temp directories can share an enclosing Git checkout on this host.
+	// Set a distinct stored ownership directory rather than assuming otherwise.
+	canonical := projectpkg.RuntimeWorktreeDirectory(root)
+	if _, err := db.DB().Exec(`UPDATE sessions SET directory = ?`, canonical+"-foreign"); err != nil {
+		t.Fatal(err)
+	}
+	if err := endClaudeHookInput(input); err == nil {
+		t.Fatal("foreign directory closed continuation")
+	}
+	live, err := db.GetSession(effective)
+	if err != nil || live.EndedAt != nil {
+		t.Fatalf("unsafe close mutated live continuation: %+v %v", live, err)
+	}
+	if _, err := db.DB().Exec(`UPDATE sessions SET directory = ?`, canonical); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := endClaudeHookInput(input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"host", effective} {
+		row, err := db.GetSession(id)
+		if err != nil || row.EndedAt == nil {
+			t.Fatalf("session %s reopened or unclosed: %+v %v", id, row, err)
+		}
+	}
+	var count int
+	if err := db.DB().QueryRow(`SELECT count(*) FROM sessions`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("end created sessions: count=%d err=%v", count, err)
+	}
+}
+
+func TestCmdHookClaudeHostEndRejectsMissingMetadata(t *testing.T) {
+	oldStdin, oldExit := os.Stdin, exitFunc
+	t.Cleanup(func() { os.Stdin, exitFunc = oldStdin, oldExit })
+	exits := 0
+	exitFunc = func(code int) {
+		if code != 1 {
+			t.Errorf("exit=%d", code)
+		}
+		exits++
+	}
+	os.Stdin = claudeHookStdin(t, `{"session_id":"host"}`, false)
+	cmdHook([]string{"claude-session-end"})
+	if exits != 1 {
+		t.Fatalf("failure exits=%d", exits)
+	}
+}
+
+func TestClaudeHostEndMissingMetadataSkipsNetwork(t *testing.T) {
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unsafe metadata contacted server: %s", r.URL)
+	}))
+	defer endpoint.Close()
+	t.Setenv("ENGRAM_URL", endpoint.URL)
+	for _, input := range []string{`{`, `{}`, `{"session_id":"host"}`, `{"session_id":42,"cwd":"/work"}`, `{"session_id":"host","cwd":" "}`} {
+		if err := endClaudeHookInput([]byte(input)); err == nil {
+			t.Fatalf("unsafe input accepted: %s", input)
+		}
 	}
 }
 
