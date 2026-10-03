@@ -151,8 +151,11 @@ plugin/claude-code/
 
 **Before Engram write/session MCP tools** (`PreToolUse`):
 1. `hooks/hooks.json` uses its canonical matcher and the portable `engram hook claude-pre-tool-use` command.
-2. When the registered hook runs, the transformer binds Claude's top-level `session_id` to tool input `session_id` (or `id` for `mem_session_start` and `mem_session_end`), replacing model-supplied values while preserving other arguments.
-3. The rewrite uses `updatedInput`; it does not auto-approve a permission decision.
+2. The guard registers Claude's host `session_id` with `resume: true` and project-owned metadata resolved from its `cwd`. It binds the acknowledged effective Engram ID to tool input `session_id` (or `id` for `mem_session_start`), replacing model-supplied values while preserving other arguments. Failed registration or invalid acknowledgements deny the call.
+3. Claude model `mem_session_end` calls are denied without contacting the server: host lifecycle owns session closure. This prevents repeated model end calls from registering accidental continuations.
+4. The rewrite uses `updatedInput`; it does not auto-approve a permission decision.
+
+`engram hook claude-session-register` reads native Claude hook JSON containing nonblank `session_id` and `cwd` from stdin. It resolves project authority and registers within a 1.5-second network deadline, then emits only `{ "id": "<effective Engram ID>" }`. Failure exits nonzero without emitting a fabricated ID. A `201` created acknowledgement must identify the host ID or explicitly name that host in `resumed_from` for a differing ID; suffixes are never guessed and no local mapping is stored. This Go helper and guard support resume binding; the shell lifecycle/prompt hooks have not yet been migrated to consume it.
 
 Session binding is best-effort if the host times out the PreToolUse hook: normal permission flow can continue without the rewrite, so an explicit wrong same-project session ID might be persisted. This limitation was reproduced with an induced one-second hook timeout in a scratch test; it has not been observed with the production hook timeout.
 

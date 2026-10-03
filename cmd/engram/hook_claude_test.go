@@ -478,6 +478,161 @@ func TestClaudeInvalidExplicitPortDeniesWithoutDefaultServer(t *testing.T) {
 	}
 }
 
+func TestClaudeResumeBinding(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.New(store.FallbackConfig(filepath.Join(root, "store")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.StartSessionWithOwnershipMode("host", "project-a", root, store.SessionOwnershipProjectOwned); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EndSession("host", "finished"); err != nil {
+		t.Fatal(err)
+	}
+	srv := server.New(db, 0)
+	authority := "project-a"
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/project/current" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"project": authority, "project_source": "config"})
+			return
+		}
+		srv.Handler().ServeHTTP(w, r)
+	}))
+	defer endpoint.Close()
+	t.Setenv("ENGRAM_URL", endpoint.URL)
+	for _, tool := range []string{"mem_save", "mem_session_start", "mem_save"} {
+		input, _ := json.Marshal(map[string]any{"session_id": "host", "cwd": root, "tool_name": "mcp__engram__" + tool, "tool_input": map[string]string{"id": "model", "session_id": "model"}})
+		var output struct {
+			HookSpecificOutput struct {
+				UpdatedInput map[string]string `json:"updatedInput"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal(guardClaudePreToolUse(input), &output); err != nil {
+			t.Fatal(err)
+		}
+		field := "session_id"
+		if tool == "mem_session_start" {
+			field = "id"
+		}
+		if output.HookSpecificOutput.UpdatedInput[field] != "host:resume:2" {
+			t.Fatalf("effective binding: %+v", output)
+		}
+		if tool == "mem_save" {
+			if _, err := db.AddObservation(store.AddObservationParams{SessionID: output.HookSpecificOutput.UpdatedInput[field], Project: "project-a", Type: "note", Title: "resumed", Content: "bound"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	original, err := db.GetSession("host")
+	if err != nil || original.EndedAt == nil {
+		t.Fatalf("root reopened: %+v %v", original, err)
+	}
+	var writes int
+	if err := db.DB().QueryRow(`SELECT count(*) FROM observations WHERE session_id = 'host:resume:2'`).Scan(&writes); err != nil || writes != 1 {
+		t.Fatalf("attribution: %d %v", writes, err)
+	}
+	input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": root})
+	authority = "project-b"
+	if response, err := registerClaudeHookInput(input); err == nil || response != nil {
+		t.Fatalf("foreign root allowed: %s %v", response, err)
+	}
+	authority = "project-a"
+	if _, err := db.DB().Exec(`UPDATE sessions SET project = 'foreign' WHERE id = 'host:resume:2'`); err != nil {
+		t.Fatal(err)
+	}
+	if response, err := registerClaudeHookInput(input); err == nil || response != nil {
+		t.Fatalf("foreign continuation allowed: %s %v", response, err)
+	}
+}
+
+func TestClaudeModelEndDeniedWithoutNetwork(t *testing.T) {
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("model end contacted server: %s", r.URL)
+	}))
+	defer endpoint.Close()
+	t.Setenv("ENGRAM_URL", endpoint.URL)
+	for i := 0; i < 2; i++ {
+		response := guardClaudePreToolUse([]byte(`{"session_id":"host","cwd":"/work","tool_name":"mcp__engram__mem_session_end","tool_input":{"id":"model"}}`))
+		if !strings.Contains(string(response), `"permissionDecision":"deny"`) || !strings.Contains(string(response), "host lifecycle") {
+			t.Fatalf("model end must deny: %s", response)
+		}
+	}
+}
+
+func TestCmdHookClaudeSessionRegister(t *testing.T) {
+	oldStdin, oldOutput, oldExit := os.Stdin, claudeHookOutput, exitFunc
+	t.Cleanup(func() { os.Stdin, claudeHookOutput, exitFunc = oldStdin, oldOutput, oldExit })
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/project/current" {
+			if r.URL.Query().Get("cwd") != "/work" {
+				t.Errorf("cwd: %s", r.URL)
+			}
+			_, _ = w.Write([]byte(`{"project":"project-a","project_source":"config"}`))
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if body["id"] != "host" || body["project"] != "project-a" || body["directory"] != "/work" || body["ownership_mode"] != "project_owned" || body["resume"] != true {
+			t.Errorf("registration: %v", body)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"opaque-continuation","status":"created","resumed_from":"host"}`))
+	}))
+	defer endpoint.Close()
+	t.Setenv("ENGRAM_URL", endpoint.URL)
+	var output []byte
+	var exits int
+	claudeHookOutput = func(data []byte) error { output = append(output, data...); return nil }
+	exitFunc = func(code int) {
+		exits++
+		if code != 1 {
+			t.Errorf("exit=%d", code)
+		}
+	}
+	os.Stdin = claudeHookStdin(t, `{"session_id":"host","cwd":"/work","tool_input":{"id":"model"}}`, false)
+	cmdHook([]string{"claude-session-register"})
+	if string(output) != `{"id":"opaque-continuation"}` || exits != 0 {
+		t.Fatalf("output=%s exits=%d", output, exits)
+	}
+	for _, input := range []string{`{`, `{}`, `{"session_id":"host","cwd":" "}`, `{"session_id":1,"cwd":"/work"}`} {
+		output = nil
+		os.Stdin = claudeHookStdin(t, input, false)
+		cmdHook([]string{"claude-session-register"})
+		if len(output) != 0 {
+			t.Fatalf("failure fabricated output: %s", output)
+		}
+	}
+	if exits != 4 {
+		t.Fatalf("failure exits=%d", exits)
+	}
+}
+
+func TestClaudeRegistrationRejectsUnsafeAuthority(t *testing.T) {
+	for _, authority := range []string{`{}`, `{"project":"foreign"}`, `{"project":"project-a","project_source":"unknown"}`, `{"project":"project-a","project_source":"config","error_hint":"invalid config"}`} {
+		t.Run(authority, func(t *testing.T) {
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/project/current" {
+					t.Errorf("unsafe authority registered: %s", r.URL)
+					return
+				}
+				_, _ = w.Write([]byte(authority))
+			}))
+			defer endpoint.Close()
+			t.Setenv("ENGRAM_URL", endpoint.URL)
+			output, err := registerClaudeHookInput([]byte(`{"session_id":"host","cwd":"/work"}`))
+			if err == nil || output != nil {
+				t.Fatalf("unsafe project allowed: %s %v", output, err)
+			}
+		})
+	}
+}
+
 func TestClaudeRegistrationRequiresMatchingCreatedResponse(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -487,6 +642,12 @@ func TestClaudeRegistrationRequiresMatchingCreatedResponse(t *testing.T) {
 		{"unavailable", http.StatusServiceUnavailable, `{}`},
 		{"mismatched id", http.StatusCreated, `{"id":"other","status":"created"}`},
 		{"malformed", http.StatusCreated, `{`},
+		{"missing id", http.StatusCreated, `{"status":"created"}`},
+		{"blank id", http.StatusCreated, `{"id":" ","status":"created","resumed_from":"host"}`},
+		{"foreign root", http.StatusCreated, `{"id":"continuation","status":"created","resumed_from":"foreign"}`},
+		{"missing status", http.StatusCreated, `{"id":"host"}`},
+		{"trailing data", http.StatusCreated, `{"id":"host","status":"created"}{}`},
+		{"wrong id type", http.StatusCreated, `{"id":1,"status":"created"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -766,8 +927,8 @@ func TestClaudeShellLifecyclePersistsOnlyLiveHostWrites(t *testing.T) {
 		t.Fatalf("registrations = %d, production 409s = %d", registered, conflicted)
 	}
 	decision, bound := preToolUse(endedHost, "must not persist")
-	if decision != "deny" || bound != nil || dispatches != 4 {
-		t.Fatalf("ended host decision %q, bound %v, dispatches %d", decision, bound, dispatches)
+	if decision == "deny" || bound["session_id"] != endedHost+":resume:2" || dispatches != 4 {
+		t.Fatalf("resumed host decision %q, bound %v, dispatches %d", decision, bound, dispatches)
 	}
 	all, err := db.AllObservations(project, "", 100)
 	if err != nil || len(all) != 4 {

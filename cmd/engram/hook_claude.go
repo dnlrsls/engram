@@ -46,12 +46,27 @@ var claudeHookOutput = func(response []byte) error {
 }
 
 func cmdHook(args []string) {
+	if len(args) == 1 && args[0] == "claude-session-register" {
+		input, err := io.ReadAll(os.Stdin)
+		var response []byte
+		if err == nil {
+			response, err = registerClaudeHookInput(input)
+		}
+		if err == nil {
+			err = claudeHookOutput(response)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Claude session registration failed:", err)
+			exitFunc(1)
+		}
+		return
+	}
 	if len(args) == 1 && args[0] == "codex-user-prompt-submit" {
 		cmdCodexUserPromptSubmit()
 		return
 	}
 	if len(args) != 1 || (args[0] != "claude-pre-tool-use" && args[0] != "codex-pre-tool-use") {
-		fmt.Fprintln(os.Stderr, "usage: engram hook claude-pre-tool-use|codex-pre-tool-use|codex-user-prompt-submit")
+		fmt.Fprintln(os.Stderr, "usage: engram hook claude-session-register|claude-pre-tool-use|codex-pre-tool-use|codex-user-prompt-submit")
 		exitFunc(1)
 		return
 	}
@@ -86,16 +101,92 @@ func guardClaudePreToolUse(input []byte) []byte {
 	if !isClaudeEngramWriteOrSessionTool(tool) {
 		return transformClaudePreToolUse(input)
 	}
-	id, idOK := claudeHookRequiredString(payload, "session_id")
-	cwd, cwdOK := claudeHookRequiredString(payload, "cwd")
-	if !idOK || !cwdOK || !confirmClaudeSession(id, cwd) {
+	for _, prefix := range claudeEngramToolPrefixes {
+		if tool == prefix+"mem_session_end" {
+			return claudePreToolUseDeny("Claude host lifecycle owns session closure; model mem_session_end is disabled")
+		}
+	}
+	response, err := registerClaudeHookInput(input)
+	if err != nil {
 		return claudePreToolUseDeny("Claude host session registration could not be confirmed")
 	}
-	return transformClaudePreToolUse(input)
+	var acknowledged map[string]json.RawMessage
+	_ = json.Unmarshal(response, &acknowledged)
+	payload["session_id"] = acknowledged["id"]
+	bound, _ := json.Marshal(payload)
+	return transformClaudePreToolUse(bound)
 }
 
-func confirmClaudeSession(id, cwd string) bool {
-	return confirmHookSession(id, cwd, true)
+// registerClaudeHookInput consumes only host metadata, never a model tool ID.
+func registerClaudeHookInput(input []byte) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(input, &payload) != nil {
+		return nil, fmt.Errorf("malformed host input")
+	}
+	id, idOK := claudeHookRequiredString(payload, "session_id")
+	cwd, cwdOK := claudeHookRequiredString(payload, "cwd")
+	if !idOK || !cwdOK {
+		return nil, fmt.Errorf("host session_id and cwd are required")
+	}
+	effective, err := registerClaudeSession(id, cwd)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]string{"id": effective})
+}
+
+func registerClaudeSession(id, cwd string) (string, error) {
+	base := strings.TrimSpace(os.Getenv("ENGRAM_URL"))
+	client := &http.Client{}
+	if base == "" {
+		if socket := strings.TrimSpace(os.Getenv("ENGRAM_SOCKET")); socket != "" {
+			base = "http://localhost"
+			client.Transport = &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+			}}
+		} else {
+			port := strings.TrimSpace(os.Getenv("ENGRAM_PORT"))
+			n, err := strconv.Atoi(port)
+			if port == "" {
+				n = 7437
+			} else if err != nil || n < 1 || n > 65535 {
+				return "", fmt.Errorf("invalid ENGRAM_PORT")
+			}
+			base = fmt.Sprintf("http://127.0.0.1:%d", n)
+		}
+	}
+	base = strings.TrimRight(base, "/")
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var authority json.RawMessage
+	if !codexJSON(ctx, client, http.MethodGet, base+"/project/current?cwd="+url.QueryEscape(cwd), nil, &authority) {
+		return "", fmt.Errorf("project resolution failed")
+	}
+	project, ok := codexProjectAuthority(authority)
+	if !ok {
+		return "", fmt.Errorf("invalid project authority")
+	}
+	body, _ := json.Marshal(map[string]any{"id": id, "project": project, "directory": cwd, "ownership_mode": "project_owned", "resume": true})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/sessions", strings.NewReader(string(body)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var ack struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"`
+		ResumedFrom string `json:"resumed_from"`
+	}
+	decoder := json.NewDecoder(resp.Body)
+	if resp.StatusCode != http.StatusCreated || decoder.Decode(&ack) != nil || decoder.Decode(&struct{}{}) != io.EOF || strings.TrimSpace(ack.ID) == "" || ack.Status != "created" || (ack.ID != id && ack.ResumedFrom != id) {
+		return "", fmt.Errorf("invalid registration acknowledgement")
+	}
+	return ack.ID, nil
 }
 
 func confirmHookSession(id, cwd string, projectOwned bool) bool {
