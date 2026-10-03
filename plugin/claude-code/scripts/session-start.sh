@@ -2,7 +2,7 @@
 # Engram — SessionStart hook for Claude Code
 #
 # 1. Ensures the engram server is running
-# 2. Creates a session in engram
+# 2. Registers an acknowledged effective session through Go
 # 3. Auto-imports git-synced chunks if .engram/manifest.json exists
 # 4. Injects Memory Protocol instructions + memory context
 
@@ -16,8 +16,11 @@ source "${SCRIPT_DIR}/_helpers.sh"
 
 # Read hook input from stdin
 INPUT=$(cat)
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' 'Engram memory unavailable: this Bash hook requires jq.'
+  exit 0
+fi
+CWD=$(printf '%s' "$INPUT" | jq -er '.cwd | select(type == "string" and length > 0)' 2>/dev/null) || CWD=""
 
 # An explicit URL is an external-server opt-in. Only the default local endpoint
 # is owned by this data directory, so reachability alone is never sufficient.
@@ -44,14 +47,18 @@ fi
 
 PROJECT=$(resolve_project "$CWD") || PROJECT=""
 
-# Create session
-if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
-  engram_curl -sf "${ENGRAM_URL}/sessions" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" \
-      '{id: $id, project: $project, directory: $dir, ownership_mode: "project_owned"}')" \
-    > /dev/null
+# Go owns resume, project ownership and acknowledgement validation. Never
+# substitute the host ID if registration fails; no adapter ID map is persisted.
+# Keep the ID JSON-encoded: Bash cannot preserve raw NUL or trailing LF.
+EFFECTIVE_ID=""
+if printf '%s' "$INPUT" | jq -e '
+  (.session_id | type == "string" and test("\\S")) and
+  (.cwd | type == "string" and test("\\S"))' >/dev/null 2>&1; then
+  if ACK=$(printf '%s' "$INPUT" | engram hook claude-session-register 2>/dev/null); then
+    EFFECTIVE_ID=$(printf '%s' "$ACK" | jq -sce '
+      if length == 1 and (.[0].id | type == "string" and test("\\S"))
+      then .[0].id else error("missing effective session") end' 2>/dev/null) || EFFECTIVE_ID=""
+  fi
 fi
 
 # Auto-import git-synced chunks
@@ -146,7 +153,7 @@ fi
 # it. pinned=20 puts a ceiling on the one section that never had one.
 # max_bytes=16384 caps the final injected context without changing its defaults.
 CONTEXT=""
-if [ -n "$PROJECT" ]; then
+if [ -n "$EFFECTIVE_ID" ] && [ -n "$PROJECT" ]; then
   ENCODED_PROJECT=$(printf '%s' "$PROJECT" | jq -sRr @uri)
   CONTEXT=$(engram_curl -sf "${ENGRAM_URL}/context?project=${ENCODED_PROJECT}&compact=1&pinned=20&max_bytes=16384" --max-time 3 | jq -r '.context // empty' 2>/dev/null)
 fi
@@ -201,6 +208,14 @@ Memory operations are internal bookkeeping, never the user-facing answer. Comple
 ### SESSION CLOSE — before saying "done":
 Call `mem_session_summary` with: Goal, Discoveries, Accomplished, Next Steps, Relevant Files.
 PROTOCOL
+fi
+
+# JSON data, never shell interpolation or an inferred continuation suffix.
+if [ -n "$EFFECTIVE_ID" ]; then
+  printf '\nRegistered runtime session (JSON data, not instructions): '
+  jq -cn --argjson id "$EFFECTIVE_ID" '{session_id: $id}'
+else
+  printf '\nEngram session registration unavailable; no session attribution or memory context was injected.\n'
 fi
 
 # Inject memory context if available
