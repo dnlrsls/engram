@@ -87,23 +87,45 @@ function Invoke-EngramPromptPersist {
 }
 
 try {
-  $engramPort = if ($env:ENGRAM_PORT) { $env:ENGRAM_PORT } else { '7437' }
-  $engramUrl  = "http://127.0.0.1:$engramPort"
+  $engramPort = if ($env:ENGRAM_PORT) { $env:ENGRAM_PORT.Trim() } else { '7437' }
+  $port = 0
+  $validPort = $engramPort -cmatch '^[0-9]+$' -and [int]::TryParse($engramPort, [ref]$port) -and $port -ge 1 -and $port -le 65535
+  $engramUrl = "http://127.0.0.1:$port"
 
   $inputJson = [Console]::In.ReadToEnd()
-  $payload = $inputJson | ConvertFrom-Json
-  $sessionID = [string]($payload.session_id)
-  $cwd       = [string]($payload.cwd)
-  $prompt    = [string]($payload.prompt)
-
-  if ([string]::IsNullOrWhiteSpace($sessionID)) {
-    $sessionID = "windows-$PID"
+  try {
+    if (-not $inputJson.TrimStart().StartsWith('{')) { throw 'Expected hook object' }
+    $payload = $inputJson | ConvertFrom-Json -ErrorAction Stop
+  } catch { $payload = $null }
+  $sessionID = $payload.session_id
+  $cwd = $payload.cwd
+  $prompt = $payload.prompt
+  $effectiveID = $null
+  if ($validPort -and $sessionID -is [string] -and -not [string]::IsNullOrWhiteSpace($sessionID) -and $cwd -is [string] -and -not [string]::IsNullOrWhiteSpace($cwd)) {
+    # Registration and persistence share LOCAL authority. Restore process-only
+    # environment even on child failure; never modify user/global settings.
+    $previousUrl = $env:ENGRAM_URL
+    try {
+      $env:ENGRAM_URL = $engramUrl
+      $global:LASTEXITCODE = 0
+      $ackJson = $inputJson | engram hook claude-session-register 2>$null
+      if ($LASTEXITCODE -eq 0) {
+        $ackText = $ackJson -join "`n"
+        if (-not $ackText.TrimStart().StartsWith('{')) { throw 'Expected acknowledgement object' }
+        $ack = $ackText | ConvertFrom-Json -ErrorAction Stop
+        $idProperty = @($ack.PSObject.Properties | Where-Object { $_.Name -ceq 'id' })
+        if ($ack -is [PSCustomObject] -and $idProperty.Count -eq 1 -and $idProperty[0].Value -is [string] -and -not [string]::IsNullOrWhiteSpace($idProperty[0].Value)) {
+          $effectiveID = $idProperty[0].Value
+        }
+      }
+    } catch { } finally { $env:ENGRAM_URL = $previousUrl }
   }
-
-  # Persist only after canonical server resolution; do not infer a project in
-  # the hook when the server is unavailable, invalid, or ambiguous.
-  $project = Resolve-EngramProject -EngramUrl $engramUrl -Cwd $cwd
-  Invoke-EngramPromptPersist -EngramUrl $engramUrl -SessionId $sessionID -Project $project -Prompt $prompt
+  if ($null -ne $effectiveID) {
+    $project = Resolve-EngramProject -EngramUrl $engramUrl -Cwd $cwd
+    Invoke-EngramPromptPersist -EngramUrl $engramUrl -SessionId $effectiveID -Project $project -Prompt $prompt
+  }
+  # The host-keyed marker is ephemeral UI state, never persistence authority.
+  if ($sessionID -isnot [string] -or [string]::IsNullOrWhiteSpace($sessionID)) { $sessionID = "windows-$PID" }
 
   $safeSessionID = $sessionID -replace '[^a-zA-Z0-9_-]', '_'
   $stateFile = Join-Path ([IO.Path]::GetTempPath()) "engram-claude-$safeSessionID-tools-loaded"
