@@ -159,6 +159,11 @@ plugin/claude-code/
 
 Session binding is best-effort if the host times out the PreToolUse hook: normal permission flow can continue without the rewrite, so an explicit wrong same-project session ID might be persisted. This limitation was reproduced with an induced one-second hook timeout in a scratch test; it has not been observed with the production hook timeout.
 
+**On host session end** (`SessionEnd`):
+`session-end.sh` forwards native hook JSON to `engram hook claude-session-end`. Go requires nonblank host `session_id` and `cwd`, resolves trustworthy project authority, and canonicalizes the runtime directory with the same resolver used by registration. It calls `POST /sessions/{host}/end` with `effective_continuation: true` and `ownership_mode: "project_owned"`. The server closes only an existing owned live root/continuation; repeated end never registers, creates, or reopens a session. Missing/unsafe metadata prevents a close request. Network operations share a 1.5-second deadline; the shell remains silent and fail-open if resolution, transport, ownership checks, or the command fail (including older binaries). No ID mapping is stored. Model `mem_session_end` remains denied before network access.
+
+Startup, compaction and prompt hooks still use their previous registration/attribution paths; their effective-ID migration is pending. Host closure support alone does not complete resume continuity.
+
 **On session start** (`startup`):
 1. Ensures the engram HTTP server is running
 2. Creates a new session via the API

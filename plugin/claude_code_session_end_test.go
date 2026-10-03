@@ -17,6 +17,46 @@ import (
 
 func TestClaudeCodeSessionEndHook(t *testing.T) {
 	requireHookBinaries(t)
+	// Mock only the executable boundary. Ownership/API behavior is exercised
+	// by TestClaudeHostEnd in cmd/engram, never by an installed executable.
+	stub := filepath.Join(t.TempDir(), "end-stub.sh")
+	if err := os.WriteFile(stub, []byte(`engram() {
+  [ "$*" = "hook claude-session-end" ] || return 1
+  input=$(cat)
+  id=$(printf '%s' "$input" | jq -er 'if (.session_id | type) == "string" and (.session_id | length) > 0 then .session_id else empty end') || return 1
+  encoded=$(printf '%s' "$id" | jq -sRr @uri) || return 1
+  if [ -n "$ENGRAM_SOCKET" ]; then
+    curl --unix-socket "$ENGRAM_SOCKET" -sf --max-time 2 -X POST "http://localhost/sessions/$encoded/end" -H 'Content-Type: application/json' -d '{}'
+  else
+    curl -sf --max-time 2 -X POST "${ENGRAM_URL:-http://127.0.0.1:${ENGRAM_PORT:-7437}}/sessions/$encoded/end" -H 'Content-Type: application/json' -d '{}'
+  fi
+}
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BASH_ENV", bashScriptPath(t, stub))
+
+	t.Run("forwards complete host metadata and ignores executable failure", func(t *testing.T) {
+		logPath := filepath.Join(t.TempDir(), "input.json")
+		if err := os.WriteFile(logPath, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		failureStub := filepath.Join(t.TempDir(), "failure.sh")
+		if err := os.WriteFile(failureStub, []byte(`engram() {
+  [ "$*" = "hook claude-session-end" ] || return 99
+  cat > "$ENGRAM_TEST_INPUT"
+  return 1
+}
+`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		input := `{"session_id":"host","cwd":"/runtime/path"}`
+		output := runHook(t, "session-end.sh", input, map[string]string{"BASH_ENV": bashScriptPath(t, failureStub), "ENGRAM_TEST_INPUT": bashScriptPath(t, logPath)})
+		data, err := os.ReadFile(logPath)
+		if err != nil || string(data) != input || output != "" {
+			t.Fatalf("forwarding: input=%q output=%q err=%v", data, output, err)
+		}
+	})
 
 	t.Run("is a synchronous SessionEnd hook", func(t *testing.T) {
 		root := repoRoot(t)
@@ -159,8 +199,8 @@ func TestClaudeCodeSessionEndHook(t *testing.T) {
 
 	t.Run("bounds transport and ignores HTTP failure", func(t *testing.T) {
 		script := claudeScript(t, "session-end.sh")
-		if !strings.Contains(script, "_helpers.sh") || !strings.Contains(script, "engram_curl") {
-			t.Error("session-end.sh must use the shared bounded transport")
+		if !strings.Contains(script, "engram hook claude-session-end") || strings.Contains(script, "engram_curl") {
+			t.Error("session-end.sh must delegate closure to the bounded Go adapter")
 		}
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)

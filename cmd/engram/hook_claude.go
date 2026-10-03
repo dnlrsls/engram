@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	projectpkg "github.com/Gentleman-Programming/engram/v3/internal/project"
 )
 
 // claudeEngramWriteAndSessionTools is the complete set of Engram MCP tools
@@ -46,6 +48,17 @@ var claudeHookOutput = func(response []byte) error {
 }
 
 func cmdHook(args []string) {
+	if len(args) == 1 && args[0] == "claude-session-end" {
+		input, err := io.ReadAll(os.Stdin)
+		if err == nil {
+			err = endClaudeHookInput(input)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Claude session closure skipped:", err)
+			exitFunc(1)
+		}
+		return
+	}
 	if len(args) == 1 && args[0] == "claude-session-register" {
 		input, err := io.ReadAll(os.Stdin)
 		var response []byte
@@ -66,7 +79,7 @@ func cmdHook(args []string) {
 		return
 	}
 	if len(args) != 1 || (args[0] != "claude-pre-tool-use" && args[0] != "codex-pre-tool-use") {
-		fmt.Fprintln(os.Stderr, "usage: engram hook claude-session-register|claude-pre-tool-use|codex-pre-tool-use|codex-user-prompt-submit")
+		fmt.Fprintln(os.Stderr, "usage: engram hook claude-session-end|claude-session-register|claude-pre-tool-use|codex-pre-tool-use|codex-user-prompt-submit")
 		exitFunc(1)
 		return
 	}
@@ -135,7 +148,40 @@ func registerClaudeHookInput(input []byte) ([]byte, error) {
 	return json.Marshal(map[string]string{"id": effective})
 }
 
-func registerClaudeSession(id, cwd string) (string, error) {
+// endClaudeHookInput never registers: repeated host end cannot allocate a continuation.
+func endClaudeHookInput(input []byte) error {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal(input, &payload) != nil {
+		return fmt.Errorf("malformed host input")
+	}
+	id, idOK := claudeHookRequiredString(payload, "session_id")
+	cwd, cwdOK := claudeHookRequiredString(payload, "cwd")
+	if !idOK || !cwdOK {
+		return fmt.Errorf("host session_id and cwd are required")
+	}
+	base, client, err := claudeSessionTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	var authority json.RawMessage
+	if !codexJSON(ctx, client, http.MethodGet, base+"/project/current?cwd="+url.QueryEscape(cwd), nil, &authority) {
+		return fmt.Errorf("project resolution failed")
+	}
+	project, ok := codexProjectAuthority(authority)
+	if !ok {
+		return fmt.Errorf("invalid project authority")
+	}
+	body, _ := json.Marshal(map[string]any{"effective_continuation": true, "project": project, "directory": projectpkg.RuntimeWorktreeDirectory(cwd), "ownership_mode": "project_owned"})
+	var result json.RawMessage
+	if !codexJSON(ctx, client, http.MethodPost, base+"/sessions/"+url.PathEscape(id)+"/end", body, &result) {
+		return fmt.Errorf("session close failed")
+	}
+	return nil
+}
+
+func claudeSessionTransport() (string, *http.Client, error) {
 	base := strings.TrimSpace(os.Getenv("ENGRAM_URL"))
 	client := &http.Client{}
 	if base == "" {
@@ -150,12 +196,19 @@ func registerClaudeSession(id, cwd string) (string, error) {
 			if port == "" {
 				n = 7437
 			} else if err != nil || n < 1 || n > 65535 {
-				return "", fmt.Errorf("invalid ENGRAM_PORT")
+				return "", nil, fmt.Errorf("invalid ENGRAM_PORT")
 			}
 			base = fmt.Sprintf("http://127.0.0.1:%d", n)
 		}
 	}
-	base = strings.TrimRight(base, "/")
+	return strings.TrimRight(base, "/"), client, nil
+}
+
+func registerClaudeSession(id, cwd string) (string, error) {
+	base, client, err := claudeSessionTransport()
+	if err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	var authority json.RawMessage
