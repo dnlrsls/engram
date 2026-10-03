@@ -163,22 +163,78 @@ func endClaudeHookInput(input []byte) error {
 	if err != nil {
 		return err
 	}
+	// Only host closure rejects redirects. Preserve the selected transport,
+	// including Unix sockets, without altering registration or Codex policy.
+	closeClient := *client
+	closeClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
-	var authority json.RawMessage
-	if !codexJSON(ctx, client, http.MethodGet, base+"/project/current?cwd="+url.QueryEscape(cwd), nil, &authority) {
-		return fmt.Errorf("project resolution failed")
+	authority, err := claudeEndJSON(ctx, &closeClient, http.MethodGet, base+"/project/current?cwd="+url.QueryEscape(cwd), nil)
+	if err != nil {
+		return fmt.Errorf("project resolution failed: %w", err)
 	}
-	project, ok := codexProjectAuthority(authority)
+	authorityJSON, _ := json.Marshal(authority)
+	project, ok := codexProjectAuthority(authorityJSON)
 	if !ok {
 		return fmt.Errorf("invalid project authority")
 	}
 	body, _ := json.Marshal(map[string]any{"effective_continuation": true, "project": project, "directory": projectpkg.RuntimeWorktreeDirectory(cwd), "ownership_mode": "project_owned"})
-	var result json.RawMessage
-	if !codexJSON(ctx, client, http.MethodPost, base+"/sessions/"+url.PathEscape(id)+"/end", body, &result) {
-		return fmt.Errorf("session close failed")
+	result, err := claudeEndJSON(ctx, &closeClient, http.MethodPost, base+"/sessions/"+url.PathEscape(id)+"/end", body)
+	if err != nil {
+		return fmt.Errorf("session close failed: %w", err)
 	}
-	return nil
+	status, ok := claudeHookRequiredString(result, "status")
+	if ok {
+		switch status {
+		case "completed":
+			// The trusted server selects the effective continuation; it need
+			// not match the host ID and must never be inferred from a suffix.
+			if _, valid := claudeHookRequiredString(result, "id"); valid {
+				return nil
+			}
+		case "no_active_session":
+			if _, present := result["id"]; !present {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("invalid session close acknowledgement")
+}
+
+// claudeEndJSON is closure-local: require HTTP 200 and a complete JSON object.
+// Read one byte beyond the cap to detect oversized bodies, including whitespace.
+const claudeEndResponseMaxBytes = 64 << 10
+
+func claudeEndJSON(ctx context.Context, client *http.Client, method, target string, body []byte) (map[string]json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, claudeEndResponseMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > claudeEndResponseMaxBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes", claudeEndResponseMaxBytes)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
+		return nil, fmt.Errorf("response must be one complete JSON object")
+	}
+	return object, nil
 }
 
 func claudeSessionTransport() (string, *http.Client, error) {

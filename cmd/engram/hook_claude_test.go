@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -594,7 +595,7 @@ func TestClaudeHostEnd(t *testing.T) {
 					t.Errorf("unsafe close body: %v", body)
 				}
 				closes++
-				_, _ = io.WriteString(w, `{"status":"completed"}`)
+				_, _ = io.WriteString(w, `{"id":"host/id","status":"completed"}`)
 			}))
 			defer endpoint.Close()
 			t.Setenv("ENGRAM_URL", endpoint.URL)
@@ -613,6 +614,184 @@ func TestClaudeHostEnd(t *testing.T) {
 				t.Fatalf("closes=%d want=%d", closes, want)
 			}
 		})
+	}
+}
+
+func TestClaudeHostEndRejectsRedirects(t *testing.T) {
+	for _, stage := range []string{"authority", "close"} {
+		for _, status := range []int{302, 303, 307, 308} {
+			t.Run(stage+"/"+strconv.Itoa(status), func(t *testing.T) {
+				var targets, closes atomic.Int64
+				endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/project/current":
+						if stage == "authority" {
+							w.Header().Set("Location", "/target")
+							w.WriteHeader(status)
+							return
+						}
+						_, _ = io.WriteString(w, `{"project":"project-a","project_source":"config"}`)
+					case "/sessions/host/end":
+						closes.Add(1)
+						w.Header().Set("Location", "/target")
+						w.WriteHeader(status)
+					case "/target":
+						targets.Add(1)
+						body, _ := io.ReadAll(r.Body)
+						t.Errorf("redirect target reached: method=%s body=%s", r.Method, body)
+						if stage == "authority" {
+							_, _ = io.WriteString(w, `{"project":"project-a","project_source":"config"}`)
+						} else {
+							_, _ = io.WriteString(w, `{"id":"continuation","status":"completed"}`)
+						}
+					default:
+						t.Errorf("unexpected request (including registration): %s %s", r.Method, r.URL)
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				defer endpoint.Close()
+				t.Setenv("ENGRAM_URL", endpoint.URL)
+				input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": t.TempDir()})
+				if err := endClaudeHookInput(input); err == nil {
+					t.Error("redirect accepted as confirmed closure")
+				}
+				wantCloses := int64(1)
+				if stage == "authority" {
+					wantCloses = 0
+				}
+				if targets.Load() != 0 || closes.Load() != wantCloses {
+					t.Errorf("target requests=%d close requests=%d, want 0/%d", targets.Load(), closes.Load(), wantCloses)
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeHostEndAcknowledgement(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		valid      bool
+	}{
+		{"different opaque completed ID", `{"id":"opaque/\"%\u0000tail\n","status":"completed","extra":true}`, 200, true},
+		{"no active session", `{"status":"no_active_session"}`, 200, true},
+		{"trailing whitespace", "{\"id\":\"continuation\",\"status\":\"completed\"} \n\t", 200, true},
+		{"exact body bound", `{"status":"no_active_session"}` + strings.Repeat(" ", (64<<10)-len(`{"status":"no_active_session"}`)), 200, true},
+		{"oversized whitespace", `{"status":"no_active_session"}` + strings.Repeat(" ", 64<<10), 200, false},
+		{"empty object", `{}`, 200, false},
+		{"unknown status", `{"id":"host","status":"other"}`, 200, false},
+		{"missing status", `{"id":"host"}`, 200, false},
+		{"numeric status", `{"id":"host","status":1}`, 200, false},
+		{"null status", `{"id":"host","status":null}`, 200, false},
+		{"wrong status case", `{"id":"host","status":"Completed"}`, 200, false},
+		{"wrong property case", `{"id":"host","Status":"completed"}`, 200, false},
+		{"missing completed ID", `{"status":"completed"}`, 200, false},
+		{"blank completed ID", `{"id":" \n","status":"completed"}`, 200, false},
+		{"numeric ID", `{"id":1,"status":"completed"}`, 200, false},
+		{"null ID", `{"id":null,"status":"completed"}`, 200, false},
+		{"array ID", `{"id":["host"],"status":"completed"}`, 200, false},
+		{"wrong ID property case", `{"ID":"host","status":"completed"}`, 200, false},
+		{"inactive with ID", `{"id":"host","status":"no_active_session"}`, 200, false},
+		{"inactive with null ID", `{"id":null,"status":"no_active_session"}`, 200, false},
+		{"array root", `[{"status":"no_active_session"}]`, 200, false},
+		{"null root", `null`, 200, false},
+		{"multiple objects", `{"status":"no_active_session"}{}`, 200, false},
+		{"trailing garbage", `{"status":"no_active_session"}garbage`, 200, false},
+		{"malformed", `{`, 200, false},
+		{"oversized", `{"status":"no_active_session","padding":"` + strings.Repeat("x", 64<<10) + `"}`, 200, false},
+		{"created status code", `{"id":"host","status":"completed"}`, 201, false},
+		{"accepted status code", `{"id":"host","status":"completed"}`, 202, false},
+		{"no content", ``, 204, false},
+		{"redirect without location", `{"status":"no_active_session"}`, 307, false},
+		{"not found", `{"status":"no_active_session"}`, 404, false},
+		{"ownership conflict", `{}`, 409, false},
+		{"server failure", `{}`, 503, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var closes atomic.Int64
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/project/current":
+					_, _ = io.WriteString(w, `{"project":"project-a","project_source":"config"}`)
+				case "/sessions/host/end":
+					closes.Add(1)
+					if r.Method != http.MethodPost {
+						t.Errorf("close method=%s", r.Method)
+					}
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, tc.body)
+				default:
+					t.Errorf("unexpected request (including registration): %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer endpoint.Close()
+			t.Setenv("ENGRAM_URL", endpoint.URL)
+			input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": t.TempDir()})
+			err := endClaudeHookInput(input)
+			if (err == nil) != tc.valid || closes.Load() != 1 {
+				t.Errorf("close error=%v requests=%d, want success=%t and one request", err, closes.Load(), tc.valid)
+			}
+		})
+	}
+}
+
+func TestClaudeHostEndRejectsInvalidAuthorityResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		status     int
+	}{
+		{"missing project", `{}`, 200},
+		{"unsafe source", `{"project":"project-a","project_source":"unknown"}`, 200},
+		{"error hint", `{"project":"project-a","project_source":"config","error_hint":"unsafe"}`, 200},
+		{"multiple objects", `{"project":"project-a","project_source":"config"}{}`, 200},
+		{"trailing garbage", `{"project":"project-a","project_source":"config"}garbage`, 200},
+		{"null root", `null`, 200},
+		{"array root", `[{"project":"project-a","project_source":"config"}]`, 200},
+		{"oversized", `{"project":"project-a","project_source":"config","padding":"` + strings.Repeat("x", 64<<10) + `"}`, 200},
+		{"created response", `{"project":"project-a","project_source":"config"}`, 201},
+		{"unavailable", `{}`, 503},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/project/current" {
+					t.Errorf("invalid authority allowed mutation: %s %s", r.Method, r.URL)
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer endpoint.Close()
+			t.Setenv("ENGRAM_URL", endpoint.URL)
+			input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": t.TempDir()})
+			if err := endClaudeHookInput(input); err == nil {
+				t.Error("invalid authority response accepted")
+			}
+		})
+	}
+}
+
+func TestClaudeHostEndDispatchRejectsInvalidAcknowledgement(t *testing.T) {
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/project/current" {
+			_, _ = io.WriteString(w, `{"project":"project-a","project_source":"config"}`)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/sessions/host/end" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+		}
+		_, _ = io.WriteString(w, `{"status":"completed"}`)
+	}))
+	defer endpoint.Close()
+	t.Setenv("ENGRAM_URL", endpoint.URL)
+	oldStdin, oldExit := os.Stdin, exitFunc
+	t.Cleanup(func() { os.Stdin, exitFunc = oldStdin, oldExit })
+	var codes []int
+	exitFunc = func(code int) { codes = append(codes, code) }
+	input, _ := json.Marshal(map[string]string{"session_id": "host", "cwd": t.TempDir()})
+	os.Stdin = claudeHookStdin(t, string(input), false)
+	cmdHook([]string{"claude-session-end"})
+	if len(codes) != 1 || codes[0] != 1 {
+		t.Fatalf("invalid acknowledgement exit codes=%v, want [1]", codes)
 	}
 }
 
