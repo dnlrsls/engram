@@ -374,19 +374,7 @@ user_prompt_submit_without_jq() {
   json_string_value_without_jq "session_id" "$INPUT" && session_id="$JSON_VALUE"
   json_string_value_without_jq "prompt" "$INPUT" && prompt="$JSON_VALUE"
 
-  if [ -n "$prompt" ] && [ -n "$session_id" ]; then
-    (
-      project=$(resolve_project_without_jq "$cwd") || exit 0
-      json_escape_without_jq "$session_id"
-      local escaped_session="$JSON_VALUE"
-      json_escape_without_jq "$project"
-      local escaped_project="$JSON_VALUE"
-      json_escape_without_jq "$prompt"
-      engram_curl -sf -X POST "${ENGRAM_URL}/prompts" --max-time 2 \
-        -H 'Content-Type: application/json' \
-        -d "{\"session_id\":\"${escaped_session}\",\"project\":\"${escaped_project}\",\"content\":\"${JSON_VALUE}\"}" >/dev/null 2>&1 || true
-    ) &
-  fi
+  # Without jq, only UI bootstrap is available; never use host IDs as authority.
 
   if [ -n "$session_id" ]; then
     session_state_key_part "$session_id"
@@ -403,61 +391,6 @@ user_prompt_submit_without_jq() {
     return 0
   fi
 
-  project=$(resolve_project_without_jq "$cwd") || {
-    printf '%s\n' '{}'
-    return 0
-  }
-
-  if [ -n "$session_id" ]; then
-    session_start=$(engram_curl -sf "${ENGRAM_URL}/sessions/${session_id}" --max-time "$ENGRAM_HOOK_MAX_TIME" 2>/dev/null)
-    json_string_value_without_jq "started_at" "$session_start" && session_start="$JSON_VALUE" || session_start=""
-  fi
-  if [ -n "$session_start" ]; then
-    session_start_epoch=$(parse_epoch "$session_start")
-    [ -n "$session_start_epoch" ] || { printf '%s\n' '{}'; return 0; }
-    now_epoch=$(date "+%s")
-    session_age_secs=$(( now_epoch - session_start_epoch ))
-    [ "$session_age_secs" -ge 300 ] || { printf '%s\n' '{}'; return 0; }
-  fi
-
-  url_encode_without_jq "$project"
-  encoded_project="$JSON_VALUE"
-  last_save_json=$(engram_curl -sf "${ENGRAM_URL}/observations?project=${encoded_project}&limit=1&sort=created_at:desc" --max-time "$ENGRAM_HOOK_MAX_TIME" 2>/dev/null) || {
-    printf '%s\n' '{}'
-    return 0
-  }
-  json_is_valid_array_without_jq "$last_save_json" || {
-    printf '%s\n' '{}'
-    return 0
-  }
-  if [[ "$last_save_json" =~ ^[[:space:]]*\[[[:space:]]*\][[:space:]]*$ ]]; then
-    [ -n "$session_age_secs" ] || { printf '%s\n' '{}'; return 0; }
-    now_epoch=$(date "+%s")
-    elapsed="$session_age_secs"
-  else
-    json_string_value_without_jq "created_at" "$last_save_json" && last_save_at="$JSON_VALUE" || last_save_at=""
-    [ -n "$last_save_at" ] || { printf '%s\n' '{}'; return 0; }
-    last_epoch=$(parse_epoch "$last_save_at")
-    [ -n "$last_epoch" ] || { printf '%s\n' '{}'; return 0; }
-    now_epoch=$(date "+%s")
-    elapsed=$(( now_epoch - last_epoch ))
-  fi
-
-  if [ "$elapsed" -ge 900 ]; then
-    nudge_cooldown="${ENGRAM_NUDGE_COOLDOWN_SECS:-900}"
-    nudge_state_file="${state_file%-tools-loaded}-last-nudge"
-    if [ -f "$nudge_state_file" ]; then
-      read -r last_nudge_epoch < "$nudge_state_file" 2>/dev/null || last_nudge_epoch=""
-    fi
-    case "$last_nudge_epoch" in
-      ''|*[!0-9]*) last_nudge_epoch="" ;;
-    esac
-    if [ -z "$last_nudge_epoch" ] || [ "$(( now_epoch - last_nudge_epoch ))" -ge "$nudge_cooldown" ]; then
-      printf '%s\n' "$now_epoch" > "$nudge_state_file" 2>/dev/null || true
-      printf '%s\n' '{"systemMessage":"MEMORY REMINDER: It'\''s been at least 15 minutes since your last save. If you'\''ve made decisions, discoveries, or completed significant work, call mem_save now."}'
-      return 0
-    fi
-  fi
   printf '%s\n' '{}'
 }
 
@@ -541,9 +474,16 @@ if ! command -v jq >/dev/null 2>&1; then
   user_prompt_submit_without_jq
   exit 0
 fi
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+CWD=$(printf '%s' "$INPUT" | jq -r '.cwd | select(type == "string")' 2>/dev/null)
+SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id | select(type == "string")' 2>/dev/null)
 PROJECT=""
+# Keep acknowledged identity as JSON: raw command substitution loses LF/NUL.
+EFFECTIVE_ID=""
+if printf '%s' "$INPUT" | jq -se 'length == 1 and (.[0] | type == "object" and (.session_id | type == "string" and test("\\S")) and (.cwd | type == "string" and test("\\S")))' >/dev/null 2>&1; then
+  if ACK=$(printf '%s' "$INPUT" | engram hook claude-session-register 2>/dev/null); then
+    EFFECTIVE_ID=$(printf '%s' "$ACK" | jq -cse 'select(length == 1) | .[0].id | select(type == "string" and test("\\S"))' 2>/dev/null) || EFFECTIVE_ID=""
+  fi
+fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROMPT PERSIST
@@ -554,14 +494,14 @@ PROJECT=""
 # fails the hook.
 # ──────────────────────────────────────────────────────────────────────────────
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty')
-if [ -n "$PROMPT" ] && [ -n "$SESSION_ID" ]; then
+if [ -n "$PROMPT" ] && [ -n "$EFFECTIVE_ID" ]; then
   # Detached subshell so the POST never stalls the hook. The server derives the
   # prompt's project from the session and rejects any mismatch.
   (
     PROJECT=$(resolve_project "$CWD") || exit 0
     engram_curl -sf -X POST "${ENGRAM_URL}/prompts" --max-time 2 \
       -H 'Content-Type: application/json' \
-      -d "$(jq -n --arg s "$SESSION_ID" --arg p "$PROJECT" --arg c "$PROMPT" \
+      -d "$(jq -n --argjson s "$EFFECTIVE_ID" --arg p "$PROJECT" --arg c "$PROMPT" \
             '{session_id:$s, project:$p, content:$c}')" >/dev/null 2>&1 || true
   ) &
 fi
@@ -600,6 +540,12 @@ fi
 # SUBSEQUENT MESSAGES — existing save-nudge logic
 # ──────────────────────────────────────────────────────────────────────────────
 
+# UI markers do not grant write or lookup authority.
+if [ -z "$EFFECTIVE_ID" ]; then
+  echo "$OUTPUT"
+  exit 0
+fi
+
 # Resolve the project only after the first-message path has had a chance to return.
 if [ -z "${PROJECT:-}" ]; then
   PROJECT=$(resolve_project "$CWD") || PROJECT=""
@@ -613,8 +559,9 @@ fi
 
 # Get session start time to check if session is > 5 minutes old
 SESSION_START=""
-if [ -n "$SESSION_ID" ]; then
-  SESSION_START=$(engram_curl -sf "${ENGRAM_URL}/sessions/${SESSION_ID}" --max-time "$ENGRAM_HOOK_MAX_TIME" 2>/dev/null \
+if [ -n "$EFFECTIVE_ID" ]; then
+  ENCODED_ID=$(printf '%s' "$EFFECTIVE_ID" | jq -r '@uri')
+  SESSION_START=$(engram_curl -sf "${ENGRAM_URL}/sessions/${ENCODED_ID}" --max-time "$ENGRAM_HOOK_MAX_TIME" 2>/dev/null \
     | jq -r '.started_at // empty' 2>/dev/null)
 fi
 

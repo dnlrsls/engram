@@ -180,9 +180,6 @@ func runClaudeCodeWindowsPromptHook(t *testing.T, powershellPath, adapterPath, p
 		t.Cleanup(func() { _ = os.Remove(stateFile) })
 	}
 
-	run := exec.Command(powershellPath, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", adapterPath)
-	run.Env = withoutEngramPort(os.Environ())
-	run.Env = append(run.Env, "ENGRAM_PORT="+port)
 	input, err := json.Marshal(map[string]string{
 		"session_id": sessionID,
 		"cwd":        cwd,
@@ -191,12 +188,72 @@ func runClaudeCodeWindowsPromptHook(t *testing.T, powershellPath, adapterPath, p
 	if err != nil {
 		t.Fatalf("marshal prompt hook input: %v", err)
 	}
-	run.Stdin = strings.NewReader(string(input))
-	output, err := run.CombinedOutput()
-	if err != nil {
-		t.Fatalf("run UserPromptSubmit adapter: %v: %s", err, output)
+	ack, _ := json.Marshal(map[string]string{"id": sessionID})
+	return runWindowsPromptFixture(t, string(input), map[string]string{
+		"ENGRAM_PORT": port, "ENGRAM_TEST_ACK": string(ack),
+		"ENGRAM_TEST_REGISTER_INPUT": filepath.Join(t.TempDir(), "registration"),
+		"TMPDIR":                     filepath.ToSlash(os.TempDir()),
+	})
+}
+
+func runWindowsPromptFixture(t *testing.T, input string, env map[string]string) string {
+	t.Helper()
+	pwsh := claudeCodePowerShell(t)
+	dir := t.TempDir()
+	child := filepath.Join(dir, "registration.ps1")
+	wrapper := filepath.Join(dir, "wrapper.ps1")
+	fake := `[IO.File]::WriteAllText($env:ENGRAM_TEST_REGISTER_INPUT, [Console]::In.ReadToEnd())
+[IO.File]::WriteAllText($env:ENGRAM_TEST_REGISTER_INPUT + '.authority', "$env:ENGRAM_URL|$env:ENGRAM_PORT|$args")
+if ($env:ENGRAM_TEST_REGISTER_FAIL -eq '1') { exit 1 }
+[Console]::Write($env:ENGRAM_TEST_ACK)
+`
+	launch := `function engram {
+  $data = @($input) -join ""
+  $start = [Diagnostics.ProcessStartInfo]::new()
+  $start.FileName = $env:ENGRAM_TEST_PWSH
+  $start.Arguments = '-NoProfile -File "' + $env:ENGRAM_TEST_CHILD + '" ' + ($args -join ' ')
+  $start.UseShellExecute = $false
+  $start.RedirectStandardInput = $true
+  $start.RedirectStandardOutput = $true
+  $p = [Diagnostics.Process]::Start($start)
+  $p.StandardInput.Write($data)
+  $p.StandardInput.Close()
+  $result = $p.StandardOutput.ReadToEnd()
+  $p.WaitForExit()
+  $global:LASTEXITCODE = $p.ExitCode
+  $p.Dispose()
+  $result
+}
+$before = $env:ENGRAM_URL
+# Dot sourcing retains the real script's exit semantics; engine exit follows finally.
+try { . $env:ENGRAM_TEST_ADAPTER } finally {
+  if ($env:ENGRAM_URL -cne $before) { throw 'registration changed parent authority' }
+}
+`
+	for path, text := range map[string]string{child: fake, wrapper: launch} {
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	return string(output)
+	cmd := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-File", wrapper)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, overridden := env[key]; !overridden && !strings.HasPrefix(strings.ToUpper(key), "ENGRAM_") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	for key, value := range env {
+		if key != "ENGRAM_URL" {
+			cmd.Env = append(cmd.Env, key+"="+value)
+		}
+	}
+	cmd.Env = append(cmd.Env, "ENGRAM_URL=http://127.0.0.1:1", "TEMP="+env["TMPDIR"], "TMP="+env["TMPDIR"], "ENGRAM_TEST_CHILD="+child, "ENGRAM_TEST_PWSH="+pwsh, "ENGRAM_TEST_ADAPTER="+filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", "user-prompt-submit.ps1"))
+	cmd.Stdin = strings.NewReader(input)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("PowerShell fixture: %v: %s", err, out)
+	}
+	return string(out)
 }
 
 func claudeCodePowerShell(t *testing.T) string {

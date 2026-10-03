@@ -159,7 +159,7 @@ func runHookWithStderr(t *testing.T, scriptName, stdin string, env map[string]st
 func runHookWithStderrInDir(t *testing.T, scriptName, stdin string, env map[string]string, dir string) (string, string) {
 	t.Helper()
 	script := filepath.Join(repoRoot(t), "plugin", "claude-code", "scripts", scriptName)
-	if (scriptName == "session-start.sh" || scriptName == "post-compaction.sh") && env["BASH_ENV"] == "" {
+	if (scriptName == "session-start.sh" || scriptName == "post-compaction.sh" || scriptName == "user-prompt-submit.sh") && env["BASH_ENV"] == "" {
 		copyEnv := make(map[string]string, len(env)+1)
 		for key, value := range env {
 			copyEnv[key] = value
@@ -294,7 +294,8 @@ func capturedUserPromptMaxTimes(t *testing.T, configured string) []string {
 	requireHookBinaries(t)
 	argsPath := filepath.Join(t.TempDir(), "curl-args")
 	bashEnv := filepath.Join(t.TempDir(), "fake-curl.sh")
-	const fakeCurlScript = `curl() {
+	const fakeCurlScript = `engram() { input=$(cat); printf '%s' "$input" | jq -c '{id:.session_id}'; }
+curl() {
   printf '%s\n' "$@" >> "$ENGRAM_TEST_CURL_ARGS"
   for arg in "$@"; do
     case "$arg" in
@@ -963,7 +964,7 @@ func claudeLifecycleMock(t *testing.T) string {
       input=$(cat)
       [ -z "$ENGRAM_TEST_REGISTER_INPUT" ] || printf '%s' "$input" > "$ENGRAM_TEST_REGISTER_INPUT"
       [ "${ENGRAM_TEST_REGISTER_FAIL:-0}" = 0 ] || return 1
-      if [ -n "$ENGRAM_TEST_ACK" ]; then printf '%s' "$ENGRAM_TEST_ACK"; else printf '%s' '{"id":"claude-parent-session"}'; fi ;;
+      if [ -n "$ENGRAM_TEST_ACK" ]; then printf '%s' "$ENGRAM_TEST_ACK"; else printf '%s' "$input" | jq -c '{id:.session_id}'; fi ;;
     'instance-id') printf '00000000000000000000000000000000\n' ;;
     'protocol-mode claude-code') printf '%s' "${ENGRAM_TEST_MODE:-full}" ;;
     *) return 1 ;;
@@ -980,11 +981,133 @@ command() {
 	return bashScriptPath(t, path)
 }
 
+func TestClaudePromptAcknowledgedRegistration(t *testing.T) {
+	for _, adapter := range []string{"bash", "powershell"} {
+		for _, tc := range []struct {
+			name, input, ack, fail string
+			register, persist      bool
+		}{
+			{"active", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"host"}`, "0", true, true},
+			{"resumed opaque", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"resume/ ?%\"$()\u0000tail\n"}`, "0", true, true},
+			{"failed", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "1", true, false},
+			{"non JSON", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `broken`, "0", true, false},
+			{"missing ID", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{}`, "0", true, false},
+			{"blank ID", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":" \n"}`, "0", true, false},
+			{"numeric ID", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":42}`, "0", true, false},
+			{"array ID", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":["other"]}`, "0", true, false},
+			{"null ID", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":null}`, "0", true, false},
+			{"array ACK", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `[{"id":"other"}]`, "0", true, false},
+			{"Windows safe mode", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+			{"multiple ACKs", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"one"} {"id":"two"}`, "0", true, false},
+			{"missing input ID", `{"cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+			{"blank cwd", `{"session_id":"host","cwd":" ","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+			{"numeric input ID", `{"session_id":42,"cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+			{"malformed input", `broken`, `{"id":"other"}`, "0", false, false},
+			{"blank input ID", `{"session_id":" \n","cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+			{"invalid local port", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+			{"no jq", `{"session_id":"host","cwd":"C:/work","prompt":"hello"}`, `{"id":"other"}`, "0", false, false},
+		} {
+			if (adapter == "powershell" && (tc.name == "no jq" || tc.name == "Windows safe mode")) || (adapter == "bash" && tc.name == "invalid local port") {
+				continue // These prerequisites are adapter-specific.
+			}
+			t.Run(adapter+"/"+tc.name, func(t *testing.T) {
+				var mu sync.Mutex
+				var ids, lookups []string
+				var projects int
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					defer mu.Unlock()
+					switch r.URL.Path {
+					case "/project/current":
+						projects++
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, `{"project":"canonical-project","project_source":"config"}`)
+					case "/prompts":
+						var p map[string]string
+						if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+							t.Error(err)
+						}
+						ids = append(ids, p["session_id"])
+						if p["project"] != "canonical-project" {
+							t.Error("lost canonical project")
+						}
+					default:
+						lookups = append(lookups, r.URL.Path)
+						http.NotFound(w, r)
+					}
+				}))
+				defer srv.Close()
+				log := filepath.Join(t.TempDir(), "registration")
+				env := map[string]string{"ENGRAM_URL": srv.URL, "ENGRAM_PORT": serverPort(t, srv), "ENGRAM_TEST_ACK": tc.ack, "ENGRAM_TEST_REGISTER_FAIL": tc.fail, "ENGRAM_TEST_REGISTER_INPUT": filepath.ToSlash(log), "TMPDIR": filepath.ToSlash(t.TempDir())}
+				if tc.name == "no jq" {
+					env["ENGRAM_TEST_NO_JQ"] = "1"
+				}
+				if tc.name == "invalid local port" {
+					env["ENGRAM_PORT"] = "invalid"
+				}
+				if tc.name == "Windows safe mode" {
+					env["ENGRAM_CLAUDE_WINDOWS_BASH_SAFE_MODE"] = "1"
+					env["OSTYPE"] = "msys"
+				}
+				for i := 0; i < 2; i++ {
+					var stdout string
+					if adapter == "bash" {
+						requireHookBinaries(t)
+						stdout = runHook(t, "user-prompt-submit.sh", tc.input, env)
+					} else {
+						stdout = runWindowsPromptFixture(t, tc.input, env)
+					}
+					decodeHookPayload(t, stdout)
+					if i == 0 && !strings.Contains(stdout, "ToolSearch") {
+						t.Error("lost fail-open bootstrap")
+					}
+				}
+				input, err := os.ReadFile(log)
+				if tc.register {
+					if err != nil || string(input) != tc.input {
+						t.Errorf("registration input %q: %v", input, err)
+					}
+					if adapter == "powershell" {
+						authority, err := os.ReadFile(log + ".authority")
+						want := srv.URL + "|" + env["ENGRAM_PORT"] + "|hook claude-session-register"
+						if err != nil || string(authority) != want {
+							t.Errorf("registration child authority/args = %q, %v; want %q", authority, err, want)
+						}
+					}
+				} else if !os.IsNotExist(err) {
+					t.Error("invalid input registered")
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				if !tc.persist {
+					if len(ids)+len(lookups)+projects != 0 {
+						t.Errorf("unconfirmed authority produced posts/lookups/projects: %v/%v/%d", ids, lookups, projects)
+					}
+					return
+				}
+				var ack map[string]string
+				_ = json.Unmarshal([]byte(tc.ack), &ack)
+				if len(ids) != 2 {
+					t.Fatalf("prompt IDs = %q, want two confirmed writes", ids)
+				}
+				for _, id := range ids {
+					if id != ack["id"] {
+						t.Errorf("prompt attributed to %q, want ACK %q", id, ack["id"])
+					}
+				}
+				if adapter == "bash" && (len(lookups) == 0 || lookups[0] != "/sessions/"+ack["id"]) {
+					t.Errorf("authoritative lookups = %q", lookups)
+				}
+			})
+		}
+	}
+}
+
 func TestClaudeLifecycleAcknowledgedRegistration(t *testing.T) {
 	requireHookBinaries(t)
 	for _, script := range []string{"session-start.sh", "post-compaction.sh"} {
 		for _, tc := range []struct {
-			name, input, ack, fail     string
+			name, input, ack, fail    string
 			wantRegister, wantContext bool
 		}{
 			{"root", `{"session_id":"root","cwd":"C:/work space"}`, `{"id":"root"}`, "0", true, true},
