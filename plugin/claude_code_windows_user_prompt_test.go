@@ -303,7 +303,9 @@ func TestClaudeBridgeOwnershipPowerShell(t *testing.T) {
 					if r.URL.Query().Get("cwd") != root {
 						t.Error("canonical cwd changed")
 					}
-					w.Write([]byte(`{"project":"canonical-project","project_source":"config"}`))
+					if _, err := w.Write([]byte(`{"project":"canonical-project","project_source":"config"}`)); err != nil {
+						t.Errorf("write canonical project response: %v", err)
+					}
 				case "/prompts":
 					if r.Method != http.MethodPost {
 						t.Error("expected POST")
