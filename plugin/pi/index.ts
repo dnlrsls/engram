@@ -75,9 +75,9 @@ const MEMORY_INSTRUCTIONS = `## Engram Persistent Memory — Protocol
 You have access to Engram, a persistent memory system that survives across sessions and compactions.
 These instructions are injected by gentle-engram, the Pi-native memory provider. Use the memory tools named in this section as the authoritative Pi memory contract. Do not infer alternative Engram tool names from other integrations unless the user explicitly asks you to use them.
 
-### WHEN TO SAVE (mandatory — not optional)
+### WHEN TO RESOLVE MEMORY IDENTITY (mandatory — not optional)
 
-Call \`mem_save\` IMMEDIATELY after any of these:
+Perform the identity workflow IMMEDIATELY after any of these:
 - Bug fix completed
 - Architecture or design decision made
 - Non-obvious discovery about the codebase
@@ -85,7 +85,44 @@ Call \`mem_save\` IMMEDIATELY after any of these:
 - Pattern established (naming, structure, convention)
 - User preference or constraint learned
 
-Format for \`mem_save\`:
+### OBSERVATION IDENTITY WORKFLOW
+
+Before every observation write, including an update, establish identity:
+1. Choose the intended project and scope (\`project\`, \`personal\`, or \`global\`).
+   Use \`mem_search\` with bounded subject keywords and explicit project and scope.
+   Do not use \`all_projects:true\` or global recall as write-identity evidence.
+   A personal/global scope does not remove the project ownership boundary.
+   Local project defaults and UI metadata are not remote argument filtering;
+   inspect returned ownership and scope rather than assuming they were filtered.
+2. Use \`mem_get_observation\` to read full content of every plausible candidate.
+   Confirm its project and scope match the intended bounds, and compare the
+   actual subject and facts. Similar titles and exact topic-key equality are
+   hints, not identity proof. \`mem_suggest_topic_key\` is a naming hint, not
+   proof of identity or absence. Never merge across projects or cross-scope.
+3. Select exactly one outcome from the fully read evidence:
+   - Proven same topic with new information: use \`mem_update\` by observation ID
+     and explicit \`expected_project\`. Preserve the existing \`topic_key\`;
+     if it has no topic key, leave it absent (omit that argument), do not invent
+     a key as identity proof. Supply complete replacement content: preserve all
+     valid independent facts and unchanged content sections, not just the new
+     fact. Put only explicitly superseded facts in a clearly labeled History
+     section; do not infer supersession from omission or a newer timestamp.
+   - Proven new topic after successful bounded search and candidate reads:
+     use \`mem_save\` with explicit project, scope, and a deliberate distinct
+     \`topic_key\` that does not collide with another topic in those bounds.
+     If a collision cannot be resolved confidently, stop without writing.
+   - Information already covered: no write. Do not update or save redundantly.
+4. Ambiguous identity or multiple plausible matches: stop, no observation write;
+   ask for clarification or report the unresolved evidence. A failed search,
+   lookup, or candidate read is not absence and does not prove a new topic.
+   Never perform a blind overwrite; no duplicate-save fallback on ambiguity
+   or failure. If bounds or full content cannot be confirmed, do not write.
+
+This is agent guidance, not server-enforced semantic identity or deduplication.
+It does not change tool schemas or make search/read/update atomic. Session
+summaries via \`mem_session_summary\` remain separate from observation identity.
+
+Format for new observation content (also retain these sections on updates):
 - **title**: Verb + what — short, searchable
 - **type**: bugfix | decision | architecture | discovery | pattern | config | preference
 - **scope**: \`project\` (default) | \`personal\` | \`global\`
@@ -1603,10 +1640,10 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
   }),
   mem_save: Type.Object({
     title: Type.String({ description: "Short, searchable title" }),
-    content: Type.String({ description: "Structured memory content" }),
+    content: Type.String({ description: "Structured content for a proven new topic after bounded project/scope search and full candidate reads; use mem_update for an existing identity" }),
     type: optionalString("Observation type/category"),
     scope: optionalString("Scope: project, personal, or global"),
-    topic_key: optionalString("Stable topic key for upserts"),
+    topic_key: optionalString("Deliberate distinct key for a proven new topic; key equality is not semantic identity proof"),
     project: optionalString("Optional explicit project"),
     cwd: optionalString("Optional directory whose Engram project receives this write; must agree with project when both are set"),
     capture_prompt: optionalBoolean("Capture current prompt when available"),
@@ -1615,10 +1652,10 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     id: Type.Number({ description: "Observation ID to update" }),
     expected_project: Type.String({ description: "Explicit expected owner of the observation" }),
     title: optionalString("New title"),
-    content: optionalString("New content"),
+    content: optionalString("Complete replacement content after bounded search and full reads; preserve valid independent facts and unchanged sections, with only explicit supersession in labeled History"),
     type: optionalString("New type/category"),
     scope: optionalString("New scope: project, personal, or global"),
-    topic_key: optionalString("New topic key"),
+    topic_key: optionalString("Preserve the existing topic key for the same topic; omit if absent, do not fabricate identity"),
   }),
   mem_delete: Type.Object({
     id: Type.Number({ description: "Observation ID to delete" }),
@@ -1627,8 +1664,8 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
   }),
   mem_suggest_topic_key: Type.Object({
     type: optionalString("Observation type/category"),
-    title: optionalString("Observation title"),
-    content: optionalString("Observation content"),
+    title: optionalString("Observation title used as a naming hint, not identity proof"),
+    content: optionalString("Observation content for a suggested naming hint; still search and read candidates before writes"),
   }),
   mem_save_prompt: Type.Object({
     content: Type.String({ description: "The user's prompt text" }),
@@ -1656,7 +1693,7 @@ const MEMORY_TOOL_SCHEMAS: Record<string, ReturnType<typeof Type.Object>> = {
     project: optionalString("Filter by project name"),
   }),
   mem_get_observation: Type.Object({
-    id: Type.Number({ description: "Observation ID to retrieve" }),
+    id: Type.Number({ description: "Plausible candidate ID to read fully before any observation write; confirm returned project, scope, subject and facts" }),
   }),
   mem_session_start: Type.Object({
     id: Type.String({ description: "Unique session identifier" }),
@@ -2071,12 +2108,21 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
   }
 }
 
+// Model-facing guidance only; transport and server enforcement remain unchanged.
+const MEMORY_TOOL_GUIDANCE: Record<string, string> = {
+  mem_search: "Before every observation save or update, search bounded subject keywords with explicit intended project and scope; confirm returned bounds. Failed search is not absence.",
+  mem_get_observation: "Read every plausible candidate fully and confirm project/scope and subject before an observation write. Failed reads do not prove absence.",
+  mem_save: "Only for a proven new topic after bounded search and full candidate reads, with a deliberate distinct topic key. Same topic uses mem_update; already covered means no write. No duplicate fallback on failure or ambiguity.",
+  mem_update: "Only for a proven same topic after bounded search and full reads. Update by ID with expected_project, preserve its existing topic key (omit if absent), valid facts and unchanged sections in complete replacement content; label only explicit supersession as History. No blind overwrite or cross-project/scope merge.",
+  mem_suggest_topic_key: "Naming hint only, not semantic identity proof; titles and exact key equality do not replace bounded search and full reads.",
+};
+
 function registerMemoryTools(pi: ExtensionAPI): void {
   for (const toolName of ENGRAM_TOOLS) {
     pi.registerTool({
       name: toolName,
       label: `Engram: ${humanToolName(toolName)}`,
-      description: `Engram memory tool: ${humanToolName(toolName)}. Compact UI is provided by gentle-engram; persistence is handled by Engram when installed and running.`,
+      description: `Engram memory tool: ${humanToolName(toolName)}. Compact UI is provided by gentle-engram; persistence is handled by Engram when installed and running.${MEMORY_TOOL_GUIDANCE[toolName] ? ` ${MEMORY_TOOL_GUIDANCE[toolName]}` : ""}`,
       promptSnippet: `Engram memory: ${humanToolName(toolName)}`,
       parameters: MEMORY_TOOL_SCHEMAS[toolName],
       renderShell: "self",

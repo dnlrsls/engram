@@ -165,6 +165,32 @@ Run the setup command for the agent you use, then restart that agent. `engram se
 
 See [Agent Setup](docs/AGENT-SETUP.md) for per-agent configuration, plugin behavior, manual MCP setup, compaction resilience, and troubleshooting. Pi users can also find the package at [`gentle-engram`](plugin/pi/README.md).
 
+### Pi observation identity workflow
+
+Pi's `gentle-engram` protocol tells the agent to resolve memory identity immediately
+when a significant fix, decision, discovery, configuration, pattern, or preference
+is learned—not to save unconditionally.
+
+Before **every observation save or update**, search bounded subject keywords with
+`mem_search` in the intended explicit project and scope, then read every plausible
+candidate fully with `mem_get_observation`. Confirm returned project, scope,
+subject, and facts. Titles, exact key equality, and `mem_suggest_topic_key` are
+hints, not identity proof. Do not use all-project recall as write evidence or merge
+across projects/scopes, even for personal/global scope. Local project defaults and
+UI metadata do not guarantee remote argument filtering; inspect returned bounds.
+
+| Evidence | Observation action |
+| --- | --- |
+| Proven same topic, new facts | `mem_update` by ID with `expected_project`; retain the existing `topic_key` (omit if absent). Supply complete replacement content preserving valid independent facts and unchanged sections. Label only explicitly superseded facts as History. |
+| Proven new topic after successful bounded lookup and full candidate reads | `mem_save` with explicit project/scope and a deliberate distinct key; stop if a key collision cannot be resolved confidently. |
+| Already covered | No write. |
+| Ambiguous matches, failed search/read, or unconfirmed bounds | No write; clarify or report uncertainty. Failed lookup is not absence, and never permits blind overwrite or duplicate-save fallback. |
+
+This is **agent guidance**, not server-enforced semantic identity, deduplication,
+or an atomic search/read/update transaction. Source-contract tests verify guidance
+text, not actual model compliance. Session summaries remain separate through
+`mem_session_summary`, including the existing session-close and compaction flows.
+
 ## Local first, portable when needed
 
 Engram keeps memory local by default. The local SQLite database is authoritative; Git Sync exports portable compressed chunks for sharing across machines, and Engram Cloud is optional, project-scoped replication/shared access with browser visibility.

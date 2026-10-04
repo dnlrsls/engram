@@ -624,6 +624,101 @@ test("memory protocol declares gentle-engram as the Pi-native provider", () => {
   assert.match(source, /Do not infer alternative Engram tool names from other integrations/);
 });
 
+// These assertions protect injected guidance, not actual model compliance or store semantics.
+function memoryProtocolForTest() {
+  const match = source.match(/const MEMORY_INSTRUCTIONS = `([\s\S]*?)\n`;/);
+  assert.ok(match, "the injected memory protocol must be available");
+  return match[1].replaceAll("\\`", "`").replace(/\s+/g, " ");
+}
+
+function memorySchemaForTest(name) {
+  return source.split(`${name}: Type.Object({`)[1].split("\n  }),")[0];
+}
+
+test("canonical topic protocol replaces immediate save triggers with immediate identity workflow", () => {
+  const protocol = memoryProtocolForTest();
+  assert.doesNotMatch(protocol, /Call `mem_save` IMMEDIATELY/i,
+    "significant events must not bypass identity discovery");
+  assert.match(protocol, /(?:immediately.{0,100}(?:identity|workflow)|(?:identity|workflow).{0,100}immediately)/i);
+  for (const trigger of ["Bug fix completed", "Architecture or design decision made",
+    "Non-obvious discovery", "Configuration change", "Pattern established", "User preference"]) {
+    assert.ok(protocol.includes(trigger), `retain the significant-event trigger: ${trigger}`);
+  }
+});
+
+test("canonical topic protocol searches bounded subject in intended project and scope before writes", () => {
+  const protocol = memoryProtocolForTest();
+  assert.match(protocol, /before every observation write, including an update/i);
+  assert.match(protocol, /explicit project and scope/i);
+  assert.match(protocol, /(?:confirm|inspect).{0,90}(?:project|ownership).{0,60}scope/i);
+  assert.match(protocol, /local.{0,90}(?:defaults|metadata).{0,90}not remote argument filtering/i);
+  assert.match(protocol, /do not use `all_projects:true`/i);
+  assert.match(protocol, /mem_search.{0,220}(?:bounded|distinctive).{0,100}(?:subject|topic|keywords)/i);
+  assert.match(protocol, /(?:intended|target|same).{0,60}project.{0,80}scope/i);
+  assert.match(protocol, /mem_get_observation.{0,160}(?:full|complete)/i);
+  assert.match(protocol, /(?:plausible|candidate).{0,160}(?:read|mem_get_observation)|(?:read|mem_get_observation).{0,160}(?:plausible|candidate)/i);
+});
+
+test("canonical topic protocol treats titles and suggested keys as hints rather than identity proof", () => {
+  const protocol = memoryProtocolForTest();
+  assert.match(protocol, /titles?.{0,180}(?:hint|not.{0,40}(?:proof|identity))/i);
+  assert.match(protocol, /mem_suggest_topic_key.{0,180}(?:hint|not.{0,40}(?:proof|identity))/i);
+});
+
+test("canonical topic protocol updates proven same topic by ID while preserving complete facts", () => {
+  const protocol = memoryProtocolForTest();
+  assert.match(protocol, /same.topic.{0,180}mem_update.{0,100}(?:ID|id)/i);
+  assert.match(protocol, /(?:preserve|retain|keep).{0,80}topic_key/i);
+  assert.match(protocol, /no topic key.{0,100}leave it absent.{0,100}do not invent/i);
+  assert.match(protocol, /unchanged content sections/i);
+  assert.match(protocol, /(?:complete|full).{0,50}replacement.{0,50}content/i);
+  assert.match(protocol, /(?:preserve|retain|keep).{0,100}(?:valid|independent).{0,60}facts/i);
+  assert.match(protocol, /(?:explicit|explicitly).{0,60}supersed/i);
+  assert.match(protocol, /(?:clearly labeled|clearly labelled|labeled|labelled).{0,50}history/i);
+});
+
+test("canonical topic protocol distinguishes new topics from already covered information", () => {
+  const protocol = memoryProtocolForTest();
+  assert.match(protocol, /new.topic.{0,180}mem_save/i);
+  assert.match(protocol, /(?:deliberate|distinct).{0,80}(?:distinct|topic_key|key)/i);
+  assert.match(protocol, /already.{0,60}(?:covered|recorded).{0,120}(?:no write|do not write|skip.{0,30}write)/i);
+});
+
+test("canonical topic protocol fails closed on ambiguity or failed lookup without duplicate fallback", () => {
+  const protocol = memoryProtocolForTest();
+  assert.match(protocol, /(?:ambiguous|ambiguity).{0,160}(?:no.{0,30}write|do not.{0,30}write|stop)/i);
+  assert.match(protocol, /(?:failed|failure).{0,100}(?:read|lookup|search)|(?:read|lookup|search).{0,100}(?:failed|failure)/i);
+  assert.match(protocol, /(?:failed|failure).{0,180}(?:not.{0,40}absence|not.{0,40}new.topic)/i);
+  assert.match(protocol, /(?:no|never|do not).{0,80}blind.{0,40}overwrite/i);
+  assert.match(protocol, /(?:no|never|do not).{0,80}duplicate.{0,40}fallback/i);
+});
+
+test("canonical topic protocol prohibits cross-project and cross-scope merges and separates summaries", () => {
+  const protocol = memoryProtocolForTest();
+  assert.match(protocol, /(?:no|never|do not).{0,80}(?:cross.project|across projects)/i);
+  assert.match(protocol, /(?:cross.scope|across scopes)/i);
+  assert.match(protocol, /mem_session_summary.{0,160}(?:separate|not.{0,50}observation)|(?:separate|not.{0,50}observation).{0,160}mem_session_summary/i);
+  assert.match(protocol, /SESSION CLOSE PROTOCOL.*mem_session_summary/);
+});
+
+test("local observation tool descriptions reinforce identity and full replacement safeguards", () => {
+  const save = memorySchemaForTest("mem_save");
+  const update = memorySchemaForTest("mem_update");
+  assert.match(save, /(?:identity|proven new|distinct)/i,
+    "save descriptions must not advertise unchecked upserts as the workflow");
+  assert.match(update, /(?:complete|full).{0,60}(?:replacement|content)/i);
+  assert.match(update, /(?:preserve|retain|keep).{0,80}(?:facts|topic key|topic_key)/i);
+  assert.match(memorySchemaForTest("mem_suggest_topic_key"), /(?:hint|not.{0,40}(?:proof|identity))/i);
+  const guidance = source.split("const MEMORY_TOOL_GUIDANCE:")[1].split("\n};")[0];
+  for (const tool of ["mem_search", "mem_get_observation", "mem_save", "mem_update", "mem_suggest_topic_key"]) {
+    assert.match(guidance, new RegExp(`${tool}: "[^"\\n]+"`), `${tool} has model-facing guidance`);
+  }
+  const registration = source.split("function registerMemoryTools(")[1].split("export default")[0];
+  assert.match(registration, /description:.*MEMORY_TOOL_GUIDANCE\[toolName\]/);
+  assert.match(memoryProtocolForTest(), /agent guidance, not server-enforced semantic identity/i);
+  assert.match(memoryProtocolForTest(), /does not.{0,80}make search\/read\/update atomic/i);
+});
+
 test("an inconclusive health probe still attempts the spawn", async () => {
   let probes = 0;
   let spawns = 0;
