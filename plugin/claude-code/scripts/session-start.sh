@@ -13,6 +13,7 @@ LOCK_METADATA_STALE_SECS=$((LOCK_TTL_SECS * 5))
 # Load shared helpers
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/_helpers.sh"
+source "${SCRIPT_DIR}/bridge-ownership.sh"
 
 # Read hook input from stdin
 INPUT=$(cat)
@@ -45,7 +46,7 @@ fi
 PROJECT=$(resolve_project "$CWD") || PROJECT=""
 
 # Create session
-if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
+if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ] && ! engram_bridge_owns registration; then
   engram_curl -sf "${ENGRAM_URL}/sessions" \
     -X POST \
     -H "Content-Type: application/json" \

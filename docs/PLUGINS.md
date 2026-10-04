@@ -26,6 +26,12 @@ Pi and OpenCode activity renews the local runtime lease through their existing s
 
 Pi sends `resume: true` for runtime-root registration and adopts only a valid acknowledged effective ID. The Go core selects numeric continuations; Pi persists the mapping in its session entries for reloads and uses it for attributed writes and shutdown `/end`. Legacy `:resume:<uuid>` mappings are re-registered as-is; an ended mapping falls back to root registration with `resume: true`. Reload does not end the session. Ownership conflicts and an older server's `409 session_already_ended` block writes rather than triggering client-generated identities.
 
+### Pi bridge and Claude hooks
+
+When native Pi Engram confirms a bridge write, it supplies scoped version-1 JSON transport markers: `PI_ENGRAM_BRIDGE_SESSION_REGISTER` and `PI_ENGRAM_BRIDGE_PROMPT_CAPTURE`. Bash hooks validate nonblank runtime/Claude identities and an exact match to the hook's `session_id`. Registration suppresses only the duplicate `/sessions` POST; capture independently suppresses only `/prompts` when its lowercase SHA-256 digest matches the original prompt after ECMAScript `trim()` (UTF-8). These claims are transport coordination, not authorization; native Engram owns confirmation.
+
+ToolSearch, memory context/protocol, project resolution, and reminder behavior remain unchanged. Unset, malformed, mismatched, or unsupported claims retain normal hook persistence, including nested Claude sessions. Pi presence alone does not suppress anything. Capture validation requires `jq` and an existing `sha256sum`; missing tools or parsing/hash failures retain capture. The no-`jq` fallback is unchanged. Native Pi skips prompts of ten or fewer trimmed characters, so short nonempty Claude prompts still persist without a confirmed capture marker.
+
 ### Codex on Windows
 - The manifest launches plugin-root `run-native-hook.ps1` through SystemRoot-qualified Windows PowerShell.
 - The adapter reads the setup-owned absolute pin and invokes its native hook command.

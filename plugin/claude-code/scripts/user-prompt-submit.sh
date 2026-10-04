@@ -492,6 +492,7 @@ fi
 # for dirname/pwd before deciding whether the safe path applies.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/_helpers.sh" "__engram_hook_default_max_time=0.2"
+source "${SCRIPT_DIR}/bridge-ownership.sh"
 
 parse_epoch() {
   TS="$1"
@@ -554,7 +555,7 @@ PROJECT=""
 # fails the hook.
 # ──────────────────────────────────────────────────────────────────────────────
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty')
-if [ -n "$PROMPT" ] && [ -n "$SESSION_ID" ]; then
+if [ -n "$PROMPT" ] && [ -n "$SESSION_ID" ] && ! engram_bridge_owns capture; then
   # Detached subshell so the POST never stalls the hook. The server derives the
   # prompt's project from the session and rejects any mismatch.
   (
