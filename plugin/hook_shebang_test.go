@@ -11,6 +11,10 @@ func TestPluginHookShebangsArePortable(t *testing.T) {
 	root := repoRoot(t)
 
 	for _, plugin := range []string{"claude-code", "codex"} {
+		wantScripts := 6
+		if plugin == "claude-code" {
+			wantScripts = 7 // Includes the shared bridge ownership helper.
+		}
 		scriptsDir := filepath.Join(root, "plugin", plugin, "scripts")
 		entries, err := os.ReadDir(scriptsDir)
 		if err != nil {
@@ -23,8 +27,8 @@ func TestPluginHookShebangsArePortable(t *testing.T) {
 				scripts = append(scripts, filepath.Join(scriptsDir, entry.Name()))
 			}
 		}
-		if len(scripts) != 6 {
-			t.Fatalf("%s scripts directory contains %d .sh files, want 6", plugin, len(scripts))
+		if len(scripts) != wantScripts {
+			t.Fatalf("%s scripts directory contains %d .sh files, want %d", plugin, len(scripts), wantScripts)
 		}
 
 		for _, script := range scripts {

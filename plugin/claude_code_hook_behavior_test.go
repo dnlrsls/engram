@@ -178,6 +178,9 @@ func runHookWithStderrInDir(t *testing.T, scriptName, stdin string, env map[stri
 		if i := strings.IndexByte(entry, '='); i >= 0 {
 			key = entry[:i]
 		}
+		if strings.HasPrefix(strings.ToUpper(key), "PI_ENGRAM_BRIDGE_") || strings.EqualFold(key, "PI_CODING_AGENT") {
+			continue // Ownership is injected only by controlled fixtures below.
+		}
 		// Keep hook tests hermetic: CLAUDE_CONFIG_DIR is unset unless the
 		// caller explicitly supplies it in env.
 		if strings.EqualFold(key, "CLAUDE_CONFIG_DIR") {
