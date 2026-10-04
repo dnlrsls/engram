@@ -141,9 +141,13 @@ func TestClaudeBridgeOwnershipBash(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/project/current":
-					io.WriteString(w, `{"project":"canonical-project","project_source":"config"}`)
+					if _, err := io.WriteString(w, `{"project":"canonical-project","project_source":"config"}`); err != nil {
+						t.Errorf("write canonical project response: %v", err)
+					}
 				case "/context":
-					io.WriteString(w, `{"context":"preserved memory context"}`)
+					if _, err := io.WriteString(w, `{"context":"preserved memory context"}`); err != nil {
+						t.Errorf("write context response: %v", err)
+					}
 				case "/sessions", "/prompts":
 					if r.Method != http.MethodPost {
 						t.Errorf("unexpected method %s", r.Method)
