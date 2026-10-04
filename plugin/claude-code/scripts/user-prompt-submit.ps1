@@ -86,12 +86,47 @@ function Invoke-EngramPromptPersist {
   } catch { }
 }
 
+function Test-BridgePromptOwnership {
+  param([string]$OriginalInput)
+  $claimDoc = $null; $inputDoc = $null; $sha = $null
+  try {
+    # System.Text.Json is strict JSON and property lookup is ordinal/case-sensitive.
+    # An unavailable parser/hash implementation leaves normal capture enabled.
+    $claimDoc = [System.Text.Json.JsonDocument]::Parse($env:PI_ENGRAM_BRIDGE_PROMPT_CAPTURE)
+    $inputDoc = [System.Text.Json.JsonDocument]::Parse($OriginalInput)
+    $claim = $claimDoc.RootElement; $original = $inputDoc.RootElement
+    if ($claim.ValueKind -ne 'Object' -or $original.ValueKind -ne 'Object') { return $false }
+    $version = $claim.GetProperty('version')
+    if ($version.ValueKind -ne 'Number' -or $version.GetDecimal() -ne 1) { return $false }
+    $runtime = $claim.GetProperty('runtimeSessionId'); $claude = $claim.GetProperty('claudeSessionId')
+    $session = $original.GetProperty('session_id'); $promptValue = $original.GetProperty('prompt')
+    $digest = $claim.GetProperty('promptDigest')
+    foreach ($value in @($runtime, $claude, $session, $promptValue, $digest)) {
+      if ($value.ValueKind -ne 'String') { return $false }
+    }
+    [char[]]$jsWhitespace = @(9,10,11,12,13,32,0xA0,0x1680,0x2000,0x2001,0x2002,0x2003,0x2004,0x2005,0x2006,0x2007,0x2008,0x2009,0x200A,0x2028,0x2029,0x202F,0x205F,0x3000,0xFEFF)
+    if ($runtime.GetString().Trim($jsWhitespace).Length -eq 0 -or $claude.GetString().Trim($jsWhitespace).Length -eq 0) { return $false }
+    if (-not [string]::Equals($session.GetString(), $claude.GetString(), [StringComparison]::Ordinal)) { return $false }
+    $expected = $digest.GetString()
+    if (-not [regex]::IsMatch($expected, '\A[0-9a-f]{64}\z')) { return $false }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $bytes = [Text.Encoding]::UTF8.GetBytes($promptValue.GetString().Trim($jsWhitespace))
+    $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+    return [string]::Equals($actual, $expected, [StringComparison]::Ordinal)
+  } catch { return $false }
+  finally {
+    if ($null -ne $sha) { $sha.Dispose() }
+    if ($null -ne $claimDoc) { $claimDoc.Dispose() }
+    if ($null -ne $inputDoc) { $inputDoc.Dispose() }
+  }
+}
+
 try {
   $engramPort = if ($env:ENGRAM_PORT) { $env:ENGRAM_PORT } else { '7437' }
   $engramUrl  = "http://127.0.0.1:$engramPort"
 
   $inputJson = [Console]::In.ReadToEnd()
-  $payload = $inputJson | ConvertFrom-Json
+  $payload = $inputJson | ConvertFrom-Json -ErrorAction Stop
   $sessionID = [string]($payload.session_id)
   $cwd       = [string]($payload.cwd)
   $prompt    = [string]($payload.prompt)
@@ -103,7 +138,9 @@ try {
   # Persist only after canonical server resolution; do not infer a project in
   # the hook when the server is unavailable, invalid, or ambiguous.
   $project = Resolve-EngramProject -EngramUrl $engramUrl -Cwd $cwd
-  Invoke-EngramPromptPersist -EngramUrl $engramUrl -SessionId $sessionID -Project $project -Prompt $prompt
+  if (-not (Test-BridgePromptOwnership -OriginalInput $inputJson)) {
+    Invoke-EngramPromptPersist -EngramUrl $engramUrl -SessionId $sessionID -Project $project -Prompt $prompt
+  }
 
   $safeSessionID = $sessionID -replace '[^a-zA-Z0-9_-]', '_'
   $stateFile = Join-Path ([IO.Path]::GetTempPath()) "engram-claude-$safeSessionID-tools-loaded"

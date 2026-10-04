@@ -32,6 +32,8 @@ When native Pi Engram confirms a bridge write, it supplies scoped version-1 JSON
 
 ToolSearch, memory context/protocol, project resolution, and reminder behavior remain unchanged. Unset, malformed, mismatched, or unsupported claims retain normal hook persistence, including nested Claude sessions. Pi presence alone does not suppress anything. Capture validation requires `jq` and an existing `sha256sum`; missing tools or parsing/hash failures retain capture. The no-`jq` fallback is unchanged. Native Pi skips prompts of ten or fewer trimmed characters, so short nonempty Claude prompts still persist without a confirmed capture marker.
 
+The manual PowerShell `UserPromptSubmit` fallback also validates capture markers and suppresses only a matching `/prompts` POST; registration markers never suppress its capture. It checks original JSON types and case-sensitive property/session identities before existing coercions, so missing or numeric sessions and synthetic `windows-PID` fallbacks cannot prove ownership. It uses strict .NET `System.Text.Json`, explicit ECMAScript whitespace, and UTF-8 SHA-256 without new dependencies; unavailable parser/hash support (including older Windows PowerShell) retains normal persistence. Canonical project resolution and first-prompt ToolSearch remain unchanged. This remains a manual override, not a manifest hook. Windows Bash safe mode remains bootstrap-only as documented below.
+
 ### Codex on Windows
 - The manifest launches plugin-root `run-native-hook.ps1` through SystemRoot-qualified Windows PowerShell.
 - The adapter reads the setup-owned absolute pin and invokes its native hook command.
