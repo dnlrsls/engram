@@ -1,0 +1,70 @@
+{
+  "name": "Issue 1686 SQLite timeout comparison",
+  "on": {
+    "push": {
+      "branches": [
+        "test/1686-linux-timeout-comparison"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "compare": {
+      "runs-on": "ubuntu-latest",
+      "timeout-minutes": 15,
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {
+          "include": [
+            {
+              "label": "base",
+              "sha": "96a6d58637a1a36209b611256a1eae71a7bac035"
+            },
+            {
+              "label": "merge-group",
+              "sha": "47578511bbe11733450d216d6904a361b307069d"
+            }
+          ]
+        }
+      },
+      "name": "${{ matrix.label }}",
+      "steps": [
+        {
+          "name": "Checkout exact upstream snapshot",
+          "uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+          "with": {
+            "repository": "Gentleman-Programming/engram",
+            "ref": "${{ matrix.sha }}",
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Set up same Go as failed CI",
+          "uses": "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16",
+          "with": {
+            "go-version": "1.25.10",
+            "cache": false
+          }
+        },
+        {
+          "name": "Record and verify environment",
+          "env": {
+            "EXPECTED_SHA": "${{ matrix.sha }}"
+          },
+          "run": "test \"$(git rev-parse HEAD)\" = \"$EXPECTED_SHA\"\nuname -a\nprintf 'Image: %s %s\\n' \"$ImageOS\" \"$ImageVersion\"\nnproc\ngo version\ngo env GOOS GOARCH CGO_ENABLED\nprintf 'Snapshot: %s\\n' \"$EXPECTED_SHA\"\ngit hash-object internal/store/concurrency_repro_test.go go.mod\ntest \"$(git hash-object internal/store/concurrency_repro_test.go)\" = '3b4d739559bc85b4b76b7983f3ca887db4789859'\ntest \"$(git hash-object go.mod)\" = 'fdcac5a8d3a40ef4429e44c36b672a36638375d0'"
+        },
+        {
+          "name": "Focused repetitions and original full suite",
+          "shell": "bash",
+          "run": "set +e\nset -o pipefail\ngo test ./internal/store -run '^TestSQLiteBeginImmediatePreventsDeadlock$' -count=50 -json 2>&1 | tee focused.log\nfocused=${PIPESTATUS[0]}\ngo test ./... -count=1 2>&1 | tee full.log\nfull=${PIPESTATUS[0]}\nprintf 'focused_exit=%s full_exit=%s\\n' \"$focused\" \"$full\"\n{ echo '## Comparison results'; printf 'Focused exit: %s; full-suite exit: %s\\n' \"$focused\" \"$full\"; } >> \"$GITHUB_STEP_SUMMARY\"\nif [ \"$focused\" -ne 0 ] || [ \"$full\" -ne 0 ]; then exit 1; fi"
+        }
+      ],
+      "env": {
+        "GOTOOLCHAIN": "local"
+      },
+      "if": "github.repository == 'dnlrsls/engram'"
+    }
+  }
+}
