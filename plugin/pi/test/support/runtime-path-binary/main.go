@@ -13,7 +13,7 @@ func record(value any) {
 	if err != nil {
 		panic(err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	if err := json.NewEncoder(file).Encode(value); err != nil {
 		panic(err)
 	}
