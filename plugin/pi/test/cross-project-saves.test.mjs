@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { fixtureHealth, fixtureContract } from "./support/runtime-contract-fixture.mjs";
 import { test } from "node:test";
 import { importPluginFromSandbox, PLUGIN_ROOT, withPluginSandbox } from "./plugin-sandbox.mjs";
 
@@ -40,7 +41,8 @@ function fakeEngram({ projectsByCwd = {}, sessionGate, sessionAck, health = { st
     const body = init.body ? JSON.parse(init.body) : undefined;
     calls.push({ method, path: request.pathname, query: request.searchParams, body });
     const json = (payload, status = 200) => new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
-    if (request.pathname === "/health") return json(health);
+    if (request.pathname === "/runtime-contract") return json(fixtureContract());
+    if (request.pathname === "/health") return json(fixtureHealth(health));
     if (request.pathname === "/project/current") {
       const cwd = request.searchParams.get("cwd");
       return json(projectsByCwd[cwd] ?? { project: "project-a", project_path: ROOT });

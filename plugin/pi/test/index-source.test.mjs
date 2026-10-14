@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { runtimeContractIdentity } from "../runtime-contract.js";
+import { runtimeMetadataResponse } from "./support/runtime-contract-fixture.mjs";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer } from "node:net";
@@ -149,6 +151,7 @@ function buildEngramFetchForTest({
     "ENGRAM_FETCH_BACKOFF_BASE_MS",
     "AbortSignal",
     "recoverImplicitEngramServer",
+    "ensureRuntimeQualification",
     `
     class EngramHttpError extends Error {
       constructor(message, status, data) {
@@ -203,6 +206,16 @@ function buildEngramFetchForTest({
     backoffBaseMs,
     abortSignal,
     recover,
+    // These extracted-function tests isolate transport policy. Qualification is
+    // an explicit collaborator with a real streamed Response fixture; the full
+    // runtime matrix exercises its network dispatch and failure behavior.
+    async (signal) => {
+      const qualification = (async () => {
+        const response = runtimeMetadataResponse("/runtime-contract");
+        runtimeContractIdentity(await response.json());
+      })();
+      await buildAwaitWithAbortForTest()(qualification, signal);
+    },
   );
 }
 
@@ -1733,7 +1746,7 @@ test("already-cancelled preflight observes a later shared initialization rejecti
   await flush();
 
   assert.match(source, /if \(signal\.aborted\) \{\s*void promise\.then\(/);
-  assert.match(source, /const data = await awaitWithAbort\(callMemoryTool\(toolName, params, ctx, transport\.fetch, appendEntry, transport\.transportFailure\), signal\);/);
+  assert.match(source, /const data = await awaitWithAbort\(callMemoryTool\(toolName, params, ctx, transport\.fetch, appendEntry, transport\.transportFailure, endInvocation\), signal\);/);
 });
 
 test("transport policies bound read, doctor and registration retries independently of writes", () => {
@@ -1865,6 +1878,10 @@ test("caller abort propagates instead of being classified as transport timeout",
   const originalFetch = globalThis.fetch;
   const controller = new AbortController();
   globalThis.fetch = async (_url, init) => new Promise((_resolve, reject) => {
+    if (init.signal.aborted) {
+      reject(init.signal.reason);
+      return;
+    }
     init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
   });
   try {

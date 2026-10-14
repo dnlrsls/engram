@@ -2,15 +2,21 @@
 // process, so these tests exercise the actual spawn/readiness/failure lifecycle instead of
 // re-implementing it with stubs.
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import childProcess, { spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { existsSync } from "node:fs";
 import { createServer as createHTTPServer, get } from "node:http";
 import { createServer } from "node:net";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import { PLUGIN_ROOT as ROOT, RUNTIME_STUB_MARKER, createPluginSandbox, importPluginFromSandbox } from "./plugin-sandbox.mjs";
+
+const runtimeProjection = JSON.parse(await readFile(join(ROOT, "runtime-contract.json"), "utf8"));
+const fixtureIdentity = "0".repeat(32);
+const runtimeResponse = { ...runtimeProjection, instance_id: fixtureIdentity };
+const fixtureHealth = { status: "ok", service: "engram", instance_id: fixtureIdentity, capabilities: { isolated_session_registration: true } };
 
 test("package advertises the implemented session-owned protocol to bundled launchers", async () => {
   const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
@@ -23,6 +29,7 @@ async function withOwnedFixture(options, run) {
   const saved = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("ENGRAM_") || key.startsWith("GENTLE_")));
   for (const key of Object.keys(saved)) delete process.env[key];
   let hooks, ctx;
+  const originalSpawn = childProcess.spawn;
   try {
     process.env.ENGRAM_SERVER_MODE = options.mode ?? "session-owned";
     process.env.ENGRAM_DATA_DIR = join(dir, "store");
@@ -37,7 +44,10 @@ const log=(v)=>appendFileSync(${JSON.stringify(log)},JSON.stringify(v)+'\\n');
 log({args:process.argv.slice(2),tokenShape:/^[a-f0-9]{64}$/.test(process.env.ENGRAM_TOKEN||'')});
 if (!process.argv.includes('--session-owned')) process.exit(3);
 const server=createServer(async(req,res)=>{
- log({path:req.url,authorized:req.headers.authorization==='Bearer '+process.env.ENGRAM_TOKEN});
+ log({path:req.url,method:req.method,authorized:req.headers.authorization==='Bearer '+process.env.ENGRAM_TOKEN});
+ if(req.headers.authorization!=='Bearer '+process.env.ENGRAM_TOKEN){res.writeHead(401);res.end('{}');return;}
+ if(req.url==='/runtime-contract'){res.setHeader('content-type','application/json');res.end(JSON.stringify(${JSON.stringify({ ...runtimeResponse, instance_id: options.contractIdentity ?? fixtureIdentity })}));return;}
+ if(req.url==='/health'){res.setHeader('content-type','application/json');res.end(JSON.stringify(${JSON.stringify(fixtureHealth)}));return;}
  let body='';for await(const c of req)body+=c;
  if(req.url==='/observations'){req.socket.destroy();return;}
  res.setHeader('content-type','application/json');
@@ -54,6 +64,14 @@ process.stdin.resume();process.stdin.on('end',()=>{log({eof:true});server.close(
 setTimeout(()=>process.exit(9),15000).unref();
 `);
     await chmod(bin, 0o755);
+    if (process.platform === "win32") {
+      // Test-only bridge for the synthetic .cjs fixture, not PATH-resolution proof.
+      // Retain a real Node child/PID, private stdin, bearer environment and signals.
+      childProcess.spawn = (command, ...args) => command === bin
+        ? originalSpawn(process.execPath, [bin, ...(args[0] ?? [])], args[1])
+        : originalSpawn(command, ...args);
+      syncBuiltinESMExports();
+    }
     process.env.ENGRAM_BIN = bin;
     const sandbox = await createPluginSandbox(dir);
     const register = await importPluginFromSandbox(sandbox);
@@ -64,6 +82,8 @@ setTimeout(()=>process.exit(9),15000).unref();
     await run({hooks,ctx,tools,warnings,statuses,log,events:async()=> (await readFile(log,"utf8")).trim().split('\n').filter(Boolean).map(v=>JSON.parse(v))});
   } finally {
     if (hooks && ctx) await hooks.get("session_shutdown")?.({reason:"reload"},ctx);
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
     for (const key of Object.keys(process.env)) if (key.startsWith("ENGRAM_") || key.startsWith("GENTLE_")) delete process.env[key];
     Object.assign(process.env,saved);
     await rm(dir,{recursive:true,force:true});
@@ -80,9 +100,27 @@ test("owned child authenticates every path and reload closes transport without e
   assert.equal(before[0].tokenShape,true);
   assert.ok(before.some(e=>e.path?.startsWith('/observations/save-result')));
   assert.ok(before.filter(e=>e.path).every(e=>e.authorized));
+  assert.equal(tools.size,22);
+  const qualification=before.findIndex(e=>e.path==='/runtime-contract');
+  assert.ok(qualification>=0);
+  assert.ok(before.findIndex(e=>e.method==='POST')>qualification,'private runtime qualification precedes memory writes');
+  assert.ok(before.filter(e=>e.method==='POST').every((e)=>before.slice(0,before.indexOf(e)).some(p=>p.path==='/runtime-contract'&&p.authorized)), 'writes use a bearer-qualified owned identity');
   await hooks.get('session_shutdown')({reason:'reload'},ctx);
   const after=await events();assert.ok(after.some(e=>e.eof));assert.ok(!after.some(e=>e.path?.endsWith('/end')));
  });
+});
+
+test("owned rejects a bearer-authenticated contract with a different private instance identity", async () => {
+  await withOwnedFixture({ contractIdentity: "f".repeat(32) }, async ({ hooks, ctx, tools, events, statuses }) => {
+    await hooks.get("session_start")({}, ctx);
+    const result = await tools.get("mem_save").execute("wrong-owned-identity", { title: "Test", content: "Must not write" }, undefined, undefined, ctx);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /contract identity does not match/);
+    assert.ok(!statuses.some(value => value?.includes("ready")));
+    const records = await events();
+    assert.ok(records.some(record => record.path === "/runtime-contract" && record.authorized));
+    assert.ok(!records.some(record => record.method === "POST"));
+  });
 });
 
 test("owned resources close even with missing session identity and preserve other hosted roots",async()=>{
@@ -196,6 +234,16 @@ if (isServe) {
   appendFileSync(${JSON.stringify(spawnLog)}, "autosync=" + (process.env.ENGRAM_CLOUD_AUTOSYNC ?? "<unset>") + "\\n");
   ${exitCode === undefined
       ? `const server = createServer(async (req, res) => {
+  if (req.url === "/runtime-contract") {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(${JSON.stringify(runtimeResponse)}));
+    return;
+  }
+  if (req.url === "/health") {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(${JSON.stringify(fixtureHealth)}));
+    return;
+  }
   if (req.url === "/sessions") {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -241,6 +289,64 @@ setTimeout(() => {
     : { engramBin: binPath };
 }
 
+test("public PATH binary auto-start qualifies runtime before normal memory writes", { timeout: 60_000, concurrency: false }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "engram-pi-real-path-"));
+  const saved = { ...process.env };
+  let plugin;
+  let port;
+  try {
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith("ENGRAM_") || key.startsWith("GENTLE_")) delete process.env[key];
+    }
+    delete process.env.NODE_OPTIONS;
+    const binary = join(dir, process.platform === "win32" ? "engram.exe" : "engram");
+    // Explicit .go input avoids module dependencies; retain the parent's offline Go/cache policy.
+    const build = spawnSync("go", ["build", "-o", binary, join(ROOT, "test", "support", "runtime-path-binary", "main.go")], {
+      env: { ...process.env, GOWORK: "off" }, encoding: "utf8", timeout: 30_000,
+    });
+    assert.equal(build.error, undefined, "stdlib fixture build must complete");
+    assert.equal(build.status, 0, build.stderr);
+    assert.equal(build.signal, null);
+    process.env.PATH = `${dir}${delimiter}${saved.PATH ?? ""}`;
+    port = await freePort();
+    process.env.ENGRAM_DATA_DIR = join(dir, "store");
+    process.env.ENGRAM_PATH_TEST_LOG = join(dir, "events.jsonl");
+    process.env.ENGRAM_PATH_TEST_CONTRACT = join(dir, "contract.json");
+    await writeFile(process.env.ENGRAM_PATH_TEST_CONTRACT, JSON.stringify(runtimeResponse));
+    const sandbox = await createPluginSandbox(dir);
+    plugin = await loadPlugin({ port, cwd: dir, sandbox });
+    assert.equal(process.env.ENGRAM_BIN, undefined);
+    assert.equal(process.env.ENGRAM_URL, undefined);
+    assert.equal(plugin.tools.size, 22);
+    await plugin.hooks.get("session_start")({}, plugin.ctx);
+    assert.ok(plugin.statusCalls.some(([, value]) => value.includes("path-project · ready")));
+    await plugin.hooks.get("before_agent_start")({ systemPrompt: "base", prompt: "A normal public PATH regression prompt" }, plugin.ctx);
+    const result = await plugin.tools.get("mem_save").execute("path-save", { title: "PATH", content: "Normal qualified operation", project: "path-project" }, undefined, undefined, plugin.ctx);
+    assert.equal(result.isError, undefined, JSON.stringify(result));
+    const records = (await readFile(process.env.ENGRAM_PATH_TEST_LOG, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.deepEqual(records.filter(record => record.args).map(record => record.args), [["instance-id"], ["serve"]]);
+    const qualification = records.findIndex(record => record.path === "/runtime-contract");
+    assert.ok(qualification >= 0);
+    assert.ok(records.findIndex(record => record.method === "POST") > qualification);
+    for (const path of ["/sessions", "/prompts", "/observations"]) assert.ok(records.some(record => record.path === path && record.method === "POST"), path);
+  } finally {
+    if (plugin) await plugin.hooks.get("session_shutdown")?.({ reason: "reload" }, plugin.ctx);
+    if (port) {
+      try { await fetch(`http://127.0.0.1:${port}/fixture-stop`, { signal: AbortSignal.timeout(2000) }); } catch { /* Child may never have started. */ }
+      // Wait for process-owned log/binary handles to close before removing the scoped fixture.
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        try { await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(200) }); }
+        catch { break; }
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("fake CLI logs logical argv for direct and preload launches", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "engram-pi-cli argv fixture-"));
   try {
@@ -284,7 +390,8 @@ test("fake CLI logs logical argv for direct and preload launches", async (t) => 
 async function loadPlugin({ engramBin, port, cwd, sandbox, explicitUrl }) {
   if (explicitUrl) process.env.ENGRAM_URL = `http://127.0.0.1:${port}`;
   else delete process.env.ENGRAM_URL;
-  process.env.ENGRAM_BIN = engramBin;
+  if (engramBin === undefined) delete process.env.ENGRAM_BIN;
+  else process.env.ENGRAM_BIN = engramBin;
   process.env.ENGRAM_PORT = String(port);
 
   const registerEngram = await importPluginFromSandbox(sandbox);
@@ -334,7 +441,13 @@ async function withFixture(options, run) {
     await writeFile(spawnLog, "", "utf8");
     const port = await freePort();
     readyServer = options.readyServer && createHTTPServer(async (request, response) => {
+      if (options.closeConnections) response.setHeader("connection", "close");
       options.requests?.push({ method: request.method, url: request.url });
+      if (request.url === "/runtime-contract") {
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify(runtimeResponse));
+        return;
+      }
       if (request.url === "/sessions") {
         let body = "";
         for await (const chunk of request) body += chunk;
@@ -343,7 +456,7 @@ async function withFixture(options, run) {
         return;
       }
       response.writeHead(request.url === "/health" ? (options.healthStatus ?? 200) : 200, { "content-type": "application/json" });
-      response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : (options.healthBody ?? { instance_id: "00000000000000000000000000000000" })));
+      response.end(JSON.stringify(request.url.startsWith("/project/current") ? { project: "fake-project" } : (options.healthBody ?? fixtureHealth)));
     });
     if (readyServer) await new Promise((resolve, reject) => {
       readyServer.once("error", reject);
@@ -556,6 +669,59 @@ test("reload shutdown does not try terminal delivery after a registered session 
     }
   });
 });
+
+for (const failedRestart of [false, true]) {
+  test(`refused contract transport preserves bounded local recovery (failed restart=${failedRestart})`, async () => {
+    await withFixture({ readyServer: true, closeConnections: true, exitCode: failedRestart ? 1 : undefined }, async ({ hooks, tools, ctx, stopServer, spawnLog }) => {
+      await hooks.get("session_start")({}, ctx);
+      assert.equal(await countSpawns(spawnLog), 0, "initial healthy server needs no spawn");
+      await stopServer();
+      const originalFetch = globalThis.fetch;
+      const events = [];
+      globalThis.fetch = async (input, init) => {
+        const path = new URL(input).pathname;
+        try {
+          const response = await originalFetch(input, init);
+          events.push({ path, status: response.status });
+          return response;
+        } catch (error) {
+          const codes = [];
+          const inspect = (value, depth = 0) => {
+            if (!value || depth > 4) return;
+            if (typeof value.code === "string") codes.push(value.code);
+            inspect(value.cause, depth + 1);
+            if (Array.isArray(value.errors)) for (const nested of value.errors.slice(0, 8)) inspect(nested, depth + 1);
+          };
+          inspect(error);
+          events.push({ path, codes, refused: codes.includes("ECONNREFUSED") });
+          throw error;
+        }
+      };
+      try {
+        const call = (id) => tools.get("mem_stats").execute(id, {}, undefined, undefined, ctx);
+        const results = await Promise.all([call("recovery-a"), call("recovery-b")]);
+        assert.ok(events.some(event => event.path === "/runtime-contract" && event.refused), "real stopped contract endpoint refuses connections: " + JSON.stringify({ events, results }));
+        for (const result of results) assert.equal(!!result.isError, failedRestart, JSON.stringify(result));
+        assert.equal(await countSpawns(spawnLog), 1, "concurrent tools share one ownership-checked recovery");
+        if (failedRestart) {
+          assert.ok(!events.some(event => event.path === "/stats"), "failed recovery dispatches no memory operation");
+          assert.equal((await call("recovery-failed-again")).isError, true);
+          assert.equal(await countSpawns(spawnLog), 1, "failed generation never spawns again");
+        } else {
+          const qualified = events.findIndex(event => event.path === "/runtime-contract" && event.status === 200);
+          const dispatched = events.findIndex(event => event.path === "/stats");
+          assert.ok(qualified >= 0 && dispatched > qualified, "recovered runtime qualifies before memory dispatch");
+          assert.equal(events.filter(event => event.path === "/stats").length, 2);
+          assert.equal((await call("recovery-alive")).isError, undefined);
+          assert.equal(await countSpawns(spawnLog), 1, "healthy runtime is not restarted again");
+        }
+      } finally {
+        globalThis.fetch = originalFetch;
+        await hooks.get("session_shutdown")({ reason: "reload" }, ctx);
+      }
+    });
+  });
+}
 
 test("an initially healthy Engram provider publishes ready status", async () => {
   await withFixture({ readyServer: true }, async ({ hooks, ctx, statusCalls }) => {

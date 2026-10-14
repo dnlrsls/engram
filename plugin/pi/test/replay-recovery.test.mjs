@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { fixtureContract, fixtureHealth } from "./support/runtime-contract-fixture.mjs";
 import { test } from "node:test";
 import { PLUGIN_ROOT, importPluginFromSandbox, withPluginSandbox } from "./plugin-sandbox.mjs";
 
@@ -21,11 +22,12 @@ async function saveWith(handler, signal) {
   process.env.ENGRAM_URL = "http://recovery.invalid";
   globalThis.fetch = async (url, options = {}) => {
     const request = new URL(url);
+    if (request.pathname === "/runtime-contract") return Response.json(fixtureContract());
     if (request.pathname === "/project/current") return Response.json({ project: "pi" });
     if (request.pathname === "/sessions") return Response.json({ id: "recovery-session", status: "created" });
     if (request.pathname === "/health") {
       healthChecks += 1;
-      return Response.json({ status: "ok" });
+      return Response.json(fixtureHealth({ status: "ok" }));
     }
     calls.push({ url: request, options });
     return handler(request, options, calls);

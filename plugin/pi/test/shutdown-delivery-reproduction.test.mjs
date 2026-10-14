@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { serveRuntimeMetadata } from './support/runtime-contract-fixture.mjs';
 import { test } from 'node:test';
 import { createServer } from 'node:http';
 import { fork } from 'node:child_process';
@@ -37,6 +38,7 @@ async function scenario(interrupted, fault) {
   let exit;
   const server = createServer((req, res) => {
     void (async () => {
+      if (serveRuntimeMetadata(req, res)) return;
       if (fault === 'handler') throw new Error('injected handler failure');
       let text = '';
       for await (const chunk of req) text += chunk;
