@@ -23,35 +23,35 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "runtime-contract: unexpected arguments; use -help")
+		_, _ = fmt.Fprintln(stderr, "runtime-contract: unexpected arguments; use -help")
 		return 2
 	}
 	projection, err := server.RuntimeContractProjection()
 	if err != nil {
-		fmt.Fprintf(stderr, "runtime-contract: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "runtime-contract: %v\n", err)
 		return 1
 	}
 	data, err := json.MarshalIndent(projection, "", "  ")
 	if err != nil {
-		fmt.Fprintf(stderr, "runtime-contract: encode projection: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "runtime-contract: encode projection: %v\n", err)
 		return 1
 	}
 	data = append(data, '\n')
 	if *check {
 		existing, err := os.ReadFile("plugin/pi/runtime-contract.json")
 		if err != nil {
-			fmt.Fprintf(stderr, "runtime-contract: read expected projection: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "runtime-contract: read expected projection: %v\n", err)
 			return 1
 		}
 		if !bytes.Equal(existing, data) {
-			fmt.Fprintln(stderr, "runtime-contract: expected projection is stale; regenerate with go run ./tools/runtime-contract")
+			_, _ = fmt.Fprintln(stderr, "runtime-contract: expected projection is stale; regenerate with go run ./tools/runtime-contract")
 			return 1
 		}
-		fmt.Fprintln(stdout, "Pi HTTP runtime projection is current")
+		_, _ = fmt.Fprintln(stdout, "Pi HTTP runtime projection is current")
 		return 0
 	}
 	if _, err := stdout.Write(data); err != nil {
-		fmt.Fprintf(stderr, "runtime-contract: write projection: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "runtime-contract: write projection: %v\n", err)
 		return 1
 	}
 	return 0
