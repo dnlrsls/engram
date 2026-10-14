@@ -489,10 +489,26 @@ Run it again when new chunks are published and you want to import them. Opening 
 
 - Pi coding agent with npm package support.
 - Engram installed as `engram` on `PATH`, or `ENGRAM_BIN` pointing at the binary.
-- For Pi-native `mem_list_projects`, a running Engram core server v2.1.0 or later, which provides HTTP `GET /projects`. If `/health` returns 200 but this tool gets a 404, upgrade and restart the server; updating `gentle-engram` alone does not add the route.
+- An Engram server exposing the exact bundled [Pi HTTP runtime contract](../../docs/RUNTIME-CONTRACT.md). `/health` success or a matching release version alone is insufficient. The initial policy rejects missing, legacy, malformed, unknown, or incompatible contracts; update Engram and restart its server and Pi. Updating `gentle-engram` alone does not add server routes.
 - No MCP extension: Pi-native `mem_*` tools come from `gentle-engram`. Pi 0.99.0 and later provide built-in MCP for other servers.
 
-If you only want HTTP session capture against an already running Engram server, set `ENGRAM_URL` and the extension will not auto-start a local `engram serve` process.
+For an already running compatible Engram server, set `ENGRAM_URL`; the extension does not probe ownership through a local binary or auto-start `engram serve`, but still validates that server's exact contract and instance identity before memory effects.
+
+### Exact runtime qualification
+
+The bundled Go-generated `runtime-contract.json` supplies expected authority, not
+model input or an environment-provided digest. Pi compares the complete stable
+projection from `GET /runtime-contract`, not just operation names or a claimed
+hash. Memory tools stay registered, but incompatible qualification blocks their
+dispatch, session registration and capture hooks; it must not report full readiness.
+Startup safety policy can still disable the provider entirely.
+
+Qualification is rechecked before memory/session dispatch. A changed bound server
+identity is rejected with restart guidance, including for externally managed URLs;
+restart Pi to bind the newly qualified server. Local and session-owned identity
+protections, private bearer authentication, and existing write uncertainty/recovery
+rules remain separate requirements. This is not remote attestation or certification
+of arbitrary MCP schemas or adapter business semantics.
 
 Background session registration reports exhausted timeout or unknown transport outcomes with safe-retry guidance, separately from invalid acknowledgement identities. Both failures block passive observations until registration is confirmed.
 
@@ -551,7 +567,7 @@ Use an already running Engram HTTP server:
 ENGRAM_URL=http://127.0.0.1:7437 pi
 ```
 
-When `ENGRAM_URL` is set, the extension treats the server as externally managed and does not auto-start `engram serve`.
+When `ENGRAM_URL` is set, the extension treats the server as externally managed and does not auto-start `engram serve`. The exact runtime contract and server identity checks still apply; explicit URLs do not authorize legacy or incompatible memory dispatch.
 
 ### Custom Engram binary
 

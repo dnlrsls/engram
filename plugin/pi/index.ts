@@ -16,6 +16,7 @@ import { Type } from "typebox";
 import { ArchiveOutcome, buildRecoveryNotice, extractCompactedSummary } from "./compaction-recovery.js";
 import { compactResultStatus, humanToolName, renderCallText, renderResultText } from "./memory-tool-chrome.js";
 import { redactPrivateTags, redactUrlPath, redactValue } from "./private-redaction.js";
+import { runtimeContractIdentity, runtimeContractID } from "./runtime-contract.js";
 
 function optionalEnvironmentValue(value: string | undefined): string | undefined {
   return value?.trim() ? value : undefined;
@@ -422,6 +423,9 @@ async function engramFetchResult<TResponse = unknown>(path: string, opts: FetchO
   let refused = false;
   let ambiguousTransport = false;
   for (let attempt = 0; attempt < policy.maxAttempts; attempt += 1) {
+    // Qualification is read-only and must precede every memory/session dispatch,
+    // including recovery and callbacks that recheck session capabilities.
+    await ensureRuntimeQualification(opts.signal);
     // Validation errors must escape, not be classified/retried as transport failures.
     if (opts.beforeDispatch) await opts.beforeDispatch();
     opts.onDispatch?.();
@@ -536,6 +540,8 @@ function isAmbiguousObservationSaveReplayStatus(status: number): boolean {
 // Only native mem_save opts in. Its request bytes and both destinations are frozen before
 // the first dispatch, so recovery cannot pick up a changed server configuration or payload.
 async function postObservationWithReplayRecovery<TResponse>(body: Record<string, unknown>, signal?: AbortSignal): Promise<EngramFetchResult<TResponse>> {
+  await ensureRuntimeQualification(signal);
+  const qualifiedInstance = acceptedRuntimeQualification;
   const operationID = randomUUID();
   const writeHeaders = transportHeaders(true);
   const lookupHeaders = transportHeaders();
@@ -573,6 +579,10 @@ async function postObservationWithReplayRecovery<TResponse>(body: Record<string,
     signal?.addEventListener("abort", onCallerAbort, { once: true });
     try {
       const exchange = (async () => {
+        await ensureRuntimeQualification(signal);
+        // After an ambiguous write, do not query or replay into another transport.
+        // The enclosing recovery path retains an unknown outcome on rejection.
+        if (acceptedRuntimeQualification !== qualifiedInstance) throw runtimeContractFailure("server binding changed during observation recovery");
         const response = await fetch(method === "POST" ? destination : lookupDestination, {
           method,
           headers: method === "POST" ? writeHeaders : lookupHeaders,
@@ -730,6 +740,83 @@ async function ensureSessionBestEffort(sessionId: string, sessionProject = proje
 // retrying it on the exponential curve only delays the recheck. Its retry cadence is a fixed
 // short window instead; transient failures keep the exponential backoff.
 class DeterministicStartupError extends Error {}
+
+class RuntimeContractError extends DeterministicStartupError {}
+type RuntimeQualification = { endpoint: string; token: string; instanceID: string };
+let acceptedRuntimeQualification: RuntimeQualification | undefined;
+let runtimeQualificationFlight: { endpoint: string; token: string; promise: Promise<void> } | undefined;
+
+function runtimeContractFailure(reason: string): RuntimeContractError {
+  // Diagnostics must not disclose credentials or query tokens from configured URLs.
+  let endpoint = "configured Engram server";
+  try { endpoint = new URL(ENGRAM_URL).origin; } catch { /* Invalid configuration. */ }
+  return new RuntimeContractError(`gentle-engram rejected the Engram runtime contract at ${endpoint}: ${reason}. Expected ${runtimeContractID}. Upgrade Engram and restart its server and Pi; verify ENGRAM_URL/ENGRAM_BIN. This dispatch was blocked before sending a memory operation.`);
+}
+
+async function ensureRuntimeQualification(signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  const endpoint = ENGRAM_URL;
+  const token = ownedToken;
+  let flight = runtimeQualificationFlight;
+  if (!flight || flight.endpoint !== endpoint || flight.token !== token) {
+    const promise = (async () => {
+      try {
+        const requestContract = () => fetch(`${endpoint}/runtime-contract`, {
+          headers: transportHeaders(), signal: AbortSignal.timeout(ENGRAM_WRITE_TIMEOUT_MS),
+        });
+        let response: Response;
+        try {
+          response = await requestContract();
+        } catch (error) {
+          // A refused read proves no contract or memory operation was dispatched.
+          // Reuse the implicit-only, generation-bounded ownership recovery; HTTP,
+          // parsing and identity failures must never authorize a restart.
+          if (!isConnectionRefusedError(error) || !await recoverImplicitEngramServer()) throw error;
+          response = await requestContract();
+        }
+        if (!response.ok) throw runtimeContractFailure(`missing or unavailable contract (HTTP ${response.status})`);
+        const reader = response.body?.getReader();
+        if (!reader) throw runtimeContractFailure("missing contract response body");
+        const chunks: Uint8Array[] = [];
+        let size = 0;
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            size += chunk.value.byteLength;
+            if (size > 65536) throw runtimeContractFailure("oversized contract response");
+            chunks.push(chunk.value);
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+        const bytes = Buffer.concat(chunks);
+        const identity = runtimeContractIdentity(JSON.parse(bytes.toString("utf8")));
+        if (endpoint !== ENGRAM_URL || token !== ownedToken) throw runtimeContractFailure("transport changed during qualification");
+        if (localEngramInstanceID && identity !== localEngramInstanceID) throw runtimeContractFailure("contract identity does not match the owned/local server");
+        const prior = acceptedRuntimeQualification;
+        if (prior && (prior.endpoint !== endpoint || prior.token !== token || prior.instanceID !== identity)) {
+          throw runtimeContractFailure("server identity changed; restart Pi to bind a fresh qualified runtime");
+        }
+        // Keep the same record object across rechecks, so observation recovery can
+        // freeze a server binding without changing its uncertainty semantics.
+        acceptedRuntimeQualification = prior ?? { endpoint, token, instanceID: identity };
+      } catch (error) {
+        if (error instanceof RuntimeContractError) throw error;
+        throw runtimeContractFailure(error instanceof SyntaxError ? "malformed JSON contract" : error instanceof Error ? error.message : "unreadable contract");
+      }
+    })();
+    flight = { endpoint, token, promise };
+    runtimeQualificationFlight = flight;
+    const current = flight;
+    void promise.finally(() => {
+      if (runtimeQualificationFlight === current) runtimeQualificationFlight = undefined;
+    }).catch(() => {});
+  }
+  // Concurrent tools share the read-only probe, not one caller's abort signal.
+  await awaitWithAbort(flight.promise, signal);
+}
 
 // "refused" means we saw proof that nothing is listening; "indeterminate" means the probe
 // told us nothing either way. Only "ready" is proof that a server is answering, so nothing
@@ -1161,6 +1248,8 @@ function closeOwnedTransport(): Promise<void> {
       ownedChild = undefined;
       ownedToken = "";
       ENGRAM_URL = "";
+      acceptedRuntimeQualification = undefined;
+      runtimeQualificationFlight = undefined;
       initialization = undefined;
       clearStartupRetryWindow();
     }
@@ -1880,6 +1969,7 @@ async function initialize(cwd: string): Promise<void> {
   project = fallbackProjectName(cwd);
 
   await initializeEngramServer();
+  await ensureRuntimeQualification();
 
   applyDetectedProject(await detectServerProject(cwd));
 }
@@ -1895,7 +1985,7 @@ function normalizeInitializationError(error: unknown): Error {
 }
 
 function initOnce(cwd: string): Promise<void> {
-  return sharedInitialization(() => initialize(cwd)).catch((error) => {
+  return sharedInitialization(() => initialize(cwd)).then(() => ensureRuntimeQualification()).catch((error) => {
     throw normalizeInitializationError(error);
   });
 }
@@ -2201,7 +2291,35 @@ function callerBindingContext(ctx: SessionContext, target: string, appendAvailab
     host_context: { append_entry_available: appendAvailable, branch_available: branchAvailable } };
 }
 
-async function callMemoryTool(toolName: string, params: Record<string, unknown>, ctx: SessionContext, fetch: EngramFetcher = engramFetch, appendEntry?: ExtensionAPI["appendEntry"], transportFailure?: () => EngramTransportFailure | undefined): Promise<unknown> {
+type ExplicitEndInvocation = {
+  runtimeID: string;
+  effectiveID: string;
+  binding: RuntimeQualification | undefined;
+  registrations: Promise<string>[];
+  ending?: Promise<unknown>;
+  owner?: string;
+};
+
+function captureExplicitEndInvocation(params: Record<string, unknown>, ctx: SessionContext, appendEntry?: ExtensionAPI["appendEntry"]): ExplicitEndInvocation | undefined {
+  const runtimeID = getSessionId(ctx);
+  if (!runtimeID || typeof params.id !== "string" || params.id !== runtimeID) return undefined;
+  const effectiveID = effectiveSessionID(ctx, runtimeID);
+  const owner = registeredSessionProjects.get(effectiveID);
+  const pending = pendingEffectiveSession(ctx, runtimeID, effectiveID);
+  const pendingOwner = pending ? pendingEffectiveSessionProject(ctx, runtimeID, effectiveID) : undefined;
+  const registrations = [...effectiveSessionRegistrations.entries()]
+    .filter(([key]) => key.endsWith(`\u0000${runtimeID}`))
+    .map(([, registration]) => registration);
+  // Observe rejection immediately without replacing the raw promise: explicit end
+  // must propagate it even if qualification yields until the flight is removed.
+  for (const registration of registrations) void registration.catch(() => {});
+  const ending = owner && (!pending || (!!appendEntry && pendingOwner === owner))
+    ? sessionEndingsInFlight.get(effectiveID) : undefined;
+  if (ending) void ending.catch(() => {});
+  return { runtimeID, effectiveID, binding: acceptedRuntimeQualification, registrations, ending, owner };
+}
+
+async function callMemoryTool(toolName: string, params: Record<string, unknown>, ctx: SessionContext, fetch: EngramFetcher = engramFetch, appendEntry?: ExtensionAPI["appendEntry"], transportFailure?: () => EngramTransportFailure | undefined, endInvocation?: ExplicitEndInvocation): Promise<unknown> {
   const sessionId = toolName === "mem_doctor" ? undefined : getSessionId(ctx);
   const runtimeSessionForWrite = () => requireRuntimeSessionID(ctx);
   const writeState = sessionId ? lifecycle(ctx, sessionId) : undefined;
@@ -2322,6 +2440,14 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
       if (typeof params.id !== "string" || !params.id || params.id !== sessionId) {
         throw new Error("Pi-native session end requires the current host session ID; end independent sessions directly outside Pi-native tools");
       }
+      // Invocation references preserve coordination, not server/ownership authority.
+      // executeMemoryTool has qualified the current runtime before reaching here.
+      if (endInvocation?.runtimeID === sessionId) {
+        if (endInvocation.binding && endInvocation.binding !== acceptedRuntimeQualification) {
+          throw runtimeContractFailure("server binding changed during explicit session end");
+        }
+        await Promise.all(endInvocation.registrations);
+      }
       // Registration may select a continuation while this explicit end is waiting.
       await Promise.all([...effectiveSessionRegistrations.entries()]
         .filter(([key]) => key.endsWith(`\u0000${sessionId}`))
@@ -2335,6 +2461,11 @@ async function callMemoryTool(toolName: string, params: Record<string, unknown>,
           throw new Error("Cannot end a pending Pi session without confirmed local project ownership and entry persistence");
         }
       }
+      const capturedEnd = endInvocation?.ending;
+      if (endInvocation && capturedEnd && endInvocation.runtimeID === sessionId
+        && endInvocation.effectiveID === endedSessionID && endInvocation.owner
+        && endInvocation.binding === acceptedRuntimeQualification
+        && (!persistedPending || owner === endInvocation.owner)) return capturedEnd;
       const pendingEnd = sessionEndingsInFlight.get(endedSessionID);
       if (pendingEnd) return pendingEnd;
       // A persisted reservation from an earlier module graph is not local proof of
@@ -2482,12 +2613,15 @@ async function executeMemoryTool(toolName: string, params: Record<string, unknow
   const transport = createMemoryToolTransport(signal);
 
   try {
+    // Capture only candidate coordination before async qualification can retire it.
+    // No captured outcome authorizes dispatch or bypasses runtime/identity checks.
+    const endInvocation = toolName === "mem_session_end" ? captureExplicitEndInvocation(params, ctx, appendEntry) : undefined;
     // Initialization runs inside the guarded path: a rejected startup must reach the agent as
     // a normalized tool error, not as a rejection escaping the Pi tool boundary.
     await awaitWithAbort(initOnce(ctx.cwd), signal);
     await refreshProjectDetection(ctx.cwd, engramFetch, signal);
     ctx.ui?.setStatus?.("engram", `🧠 ${project} · ${action}…`);
-    const data = await awaitWithAbort(callMemoryTool(toolName, params, ctx, transport.fetch, appendEntry, transport.transportFailure), signal);
+    const data = await awaitWithAbort(callMemoryTool(toolName, params, ctx, transport.fetch, appendEntry, transport.transportFailure, endInvocation), signal);
     const failure = transport.transportFailure();
     if (failure) throw new Error(unreachableMessage(failure));
 
