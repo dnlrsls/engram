@@ -35,6 +35,22 @@ Once the issue is approved:
 3. Open a PR using the PR template — **link the approved issue** with `Closes #N`
 4. Add exactly **one `type:*` label** to the PR (see label system below)
 
+Closing references can also be qualified: `Closes OWNER/REPO#N`, `Fixes OWNER/REPO#N`,
+or `Resolves OWNER/REPO#N`. Bare `#N` references resolve in the current repository.
+Qualified references are accepted only for the current repository or the explicitly
+trusted upstream `Gentleman-Programming/engram` (repository identity is case-insensitive).
+For example, a fork PR can use `Closes Gentleman-Programming/engram#1350` without
+creating a mirror issue. Every recognized reference must be approved in its own
+repository. An untrusted qualified reference rejects the whole batch before any
+issue lookup, including when mixed with a trusted reference. An approval label in
+an arbitrary external repository does not authorize work here.
+
+The deterministic workflow-script regression suite runs without GitHub mutations:
+`node --test .github/scripts/issue-reference-workflow.test.mjs`.
+This CI-only candidate does not register a missing label workflow, change required
+contexts, or update the inline workflow definitions on existing feature branches.
+Those activation steps require separate reviewed delivery changes.
+
 ### Step 4: Automated PR Checks
 
 Five checks run automatically on every PR:
@@ -43,8 +59,8 @@ Five checks run automatically on every PR:
 
 | Check | What it verifies |
 |-------|-----------------|
-| **Check Issue Reference** | PR body contains `Closes #N`, `Fixes #N`, or `Resolves #N` |
-| **Check Issue Has status:approved** | The linked issue has the `status:approved` label |
+| **Check Issue Reference** | PR body contains a bare or trusted repository-qualified `Closes`, `Fixes`, or `Resolves` reference |
+| **Check Issue Has status:approved** | Every linked issue has `status:approved` in its resolved repository |
 | **Check PR Has type:* Label** | PR has exactly one `type:*` label |
 
 #### CI Tests

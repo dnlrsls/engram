@@ -14,8 +14,14 @@ jobs:
         with:
           script: |
             const body = context.payload.pull_request.body || '';
-            const issuePattern = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
+            const issuePattern = /(?:closes|fixes|resolves)\s+(?:([a-z0-9-]+)\/([a-z0-9_.-]+))?#(\d+)/gi;
             const matches = [...body.matchAll(issuePattern)];
+            const trustedRepos = [`${context.repo.owner}/${context.repo.repo}`.toLowerCase(), 'gentleman-programming/engram'];
+            const untrusted = matches.find(match => match[1] && !trustedRepos.includes(`${match[1]}/${match[2]}`.toLowerCase()));
+            if (untrusted) {
+              core.setFailed(`❌ Issue reference uses an untrusted repository: ${untrusted[1]}/${untrusted[2]}.`);
+              return;
+            }
 
             if (matches.length === 0) {
               core.setFailed(
@@ -24,8 +30,10 @@ jobs:
                 'See CONTRIBUTING.md for the full contribution workflow.'
               );
             } else {
-              const issueNumbers = matches.map(m => m[1]).join(', ');
-              core.info(`✅ Found issue reference(s): #${issueNumbers}`);
+              const references = matches.some(match => match[1])
+                ? matches.map(match => `${match[1] ? `${match[1]}/${match[2]}` : ''}#${match[3]}`).join(', ')
+                : `#${matches.map(match => match[3]).join(', ')}`;
+              core.info(`✅ Found issue reference(s): ${references}`);
             }
 
   check-issue-approved:
@@ -39,8 +47,14 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const body = context.payload.pull_request.body || '';
-            const issuePattern = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
+            const issuePattern = /(?:closes|fixes|resolves)\s+(?:([a-z0-9-]+)\/([a-z0-9_.-]+))?#(\d+)/gi;
             const matches = [...body.matchAll(issuePattern)];
+            const trustedRepos = [`${context.repo.owner}/${context.repo.repo}`.toLowerCase(), 'gentleman-programming/engram'];
+            const untrusted = matches.find(match => match[1] && !trustedRepos.includes(`${match[1]}/${match[2]}`.toLowerCase()));
+            if (untrusted) {
+              core.setFailed(`❌ Issue reference uses an untrusted repository: ${untrusted[1]}/${untrusted[2]}.`);
+              return;
+            }
 
             if (matches.length === 0) {
               core.setFailed('❌ No issue reference found in PR body.');
@@ -50,32 +64,33 @@ jobs:
             const failures = [];
 
             for (const match of matches) {
-              const issueNumber = parseInt(match[1], 10);
-              core.info(`Checking issue #${issueNumber} for status:approved label...`);
+              const issueNumber = parseInt(match[3], 10);
+              const issueRef = `${match[1] ? `${match[1]}/${match[2]}` : ''}#${issueNumber}`;
+              core.info(`Checking issue ${issueRef} for status:approved label...`);
 
               let issue;
               try {
                 const response = await github.rest.issues.get({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner: match[1] || context.repo.owner,
+                  repo: match[2] || context.repo.repo,
                   issue_number: issueNumber,
                 });
                 issue = response.data;
               } catch (err) {
-                failures.push(`Issue #${issueNumber}: could not be fetched (${err.message})`);
+                failures.push(`Issue ${issueRef}: could not be fetched (${err.message})`);
                 continue;
               }
 
               const labels = issue.labels.map(l => l.name);
-              core.info(`Issue #${issueNumber} labels: ${labels.join(', ') || '(none)'}`);
+              core.info(`Issue ${issueRef} labels: ${labels.join(', ') || '(none)'}`);
 
               if (!labels.includes('status:approved')) {
                 failures.push(
-                  `Issue #${issueNumber} ("${issue.title}") does not have the \`status:approved\` label. ` +
+                  `Issue ${issueRef} ("${issue.title}") does not have the \`status:approved\` label. ` +
                   `A maintainer must approve the issue before a PR can be merged.`
                 );
               } else {
-                core.info(`✅ Issue #${issueNumber} has status:approved`);
+                core.info(`✅ Issue ${issueRef} has status:approved`);
               }
             }
 
