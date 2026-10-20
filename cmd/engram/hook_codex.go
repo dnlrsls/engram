@@ -257,6 +257,15 @@ func cmdCodexLifecycle(action string) {
 	if err != nil {
 		return
 	}
+	if os.Getenv("ENGRAM_HOOK_OUTPUT") == "json-project" && (action == "codex-register" || action == "codex-resolve") {
+		ctx, cancel := context.WithTimeout(context.Background(), codexUserPromptDeadline)
+		defer cancel()
+		id, project := codexLifecycleProjectResult(ctx, action, data, codexHookURL())
+		if project != "" {
+			_ = json.NewEncoder(os.Stdout).Encode(map[string]string{"session_id": id, "project": project})
+		}
+		return
+	}
 	result := runCodexLifecycle(action, data, codexHookURL())
 	if result != "" {
 		// Internal shell callers opt into JSON to retain opaque identity bytes.
@@ -267,6 +276,44 @@ func cmdCodexLifecycle(action string) {
 			_, _ = fmt.Fprintln(os.Stdout, result)
 		}
 	}
+}
+
+// codexLifecycleProjectResult keeps read-only context independent of a live
+// session acknowledgement. Only the opt-in projection uses this result shape.
+func codexLifecycleProjectResult(ctx context.Context, action string, data []byte, base string) (string, string) {
+	var in codexPromptInput
+	if json.Unmarshal(data, &in) == nil && strings.TrimSpace(in.SessionID) != "" {
+		id, project, _ := codexLifecycleSelection(ctx, action, data, base)
+		return id, project
+	}
+
+	// Invalid host input cannot bind or register a session. Context may still
+	// use a trusted cwd, but never a model-supplied project or session.
+	cwd, ok := hookProjectCWD(data)
+	if !ok || base == "" {
+		return "", ""
+	}
+	var fields struct {
+		SessionID json.RawMessage `json:"session_id"`
+	}
+	if json.Unmarshal(data, &fields) != nil {
+		return "", ""
+	}
+	var host string
+	_ = json.Unmarshal(fields.SessionID, &host)
+	_, client := hookEndpointClient(base)
+	if strings.TrimSpace(host) == "" && hookUsesClientProject() {
+		project, err := hookResolveCwdProject(ctx, client, base, cwd)
+		if err != nil {
+			return "", ""
+		}
+		return "", project
+	}
+	project, ok := codexHookProject(ctx, client, base, host, cwd)
+	if !ok {
+		return "", ""
+	}
+	return "", project
 }
 
 // Runtime identity belongs to the core, not a second platform-specific cache.
@@ -283,25 +330,33 @@ func runCodexLifecycleContext(ctx context.Context, action string, data []byte, b
 }
 
 func runCodexLifecycleResult(ctx context.Context, action string, data []byte, base string) (string, string) {
+	id, _, failure := codexLifecycleSelection(ctx, action, data, base)
+	return id, failure
+}
+
+// Project is the value already selected for this operation, not a second lookup
+// or a field supplied by the model. Legacy callers retain their result shape.
+func codexLifecycleSelection(ctx context.Context, action string, data []byte, base string) (string, string, string) {
 	const failure = "Codex host session resolution could not be confirmed"
 	var in codexPromptInput
 	if json.Unmarshal(data, &in) != nil || strings.TrimSpace(in.SessionID) == "" || strings.TrimSpace(in.CWD) == "" || base == "" {
-		return "", failure
+		return "", "", failure
 	}
 	_, client := hookEndpointClient(base)
 	project, ok := codexHookProject(ctx, client, base, in.SessionID, in.CWD)
 	if !ok {
-		return "", failure
+		return "", "", failure
 	}
 	switch action {
 	case "codex-register":
-		return codexRegisterAt(ctx, client, base, in.SessionID, in.CWD, project), ""
+		return codexRegisterAt(ctx, client, base, in.SessionID, in.CWD, project), project, ""
 	case "codex-resolve":
-		return codexRuntimeResult(ctx, client, base, in.SessionID, in.CWD, project, "resolve")
+		id, reason := codexRuntimeResult(ctx, client, base, in.SessionID, in.CWD, project, "resolve")
+		return id, project, reason
 	case "codex-session-end":
 		_ = codexRuntimeAt(ctx, client, base, in.SessionID, in.CWD, project, "end")
 	}
-	return "", failure
+	return "", "", failure
 }
 
 // codexHookProject selects identity without changing runtime scope semantics.

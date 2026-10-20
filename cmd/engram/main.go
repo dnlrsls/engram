@@ -3996,6 +3996,11 @@ Environment:
                      Claude/Codex hooks, including loopback SSH tunnel URLs. Unset/blank
                      retains server resolution over local port/socket defaults. Registered
                      owners and server permission checks remain authoritative.
+  ENGRAM_HOOK_OUTPUT Internal codex-register/resolve output mode: json returns session_id;
+                     json-project also returns the Go-selected project for lifecycle context.
+                     An empty session_id permits read-only context, never agent-attributed writes.
+                     Failed required inspection or owner lookup emits no project.
+                     Default text and other values retain the existing text output.
   ENGRAM_HOOK_SESSION_CONFIRMATION_TIMEOUT
                      Total inspection/HTTP budget for Claude/Codex PreToolUse (default: 4s).
                      Accepts a positive Go duration, e.g. 8s or 500ms; unset, blank,
