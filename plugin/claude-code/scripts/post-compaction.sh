@@ -32,11 +32,13 @@ if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
     | jq -e --arg id "$SESSION_ID" '.id == $id and .ended_at != null and .ownership_mode == "shared"' >/dev/null 2>&1; then
     OWNERSHIP_MODE="shared"
   fi
-  engram_curl -sf "${ENGRAM_URL}/sessions" \
+  SESSION_BODY="$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" --arg mode "$OWNERSHIP_MODE" \
+    '{id: $id, project: $project, directory: $dir, ownership_mode: $mode, resume: true}')"
+  # Keep JSON bytes off native curl's command-line argument boundary.
+  printf '%s' "$SESSION_BODY" | engram_curl -sf "${ENGRAM_URL}/sessions" \
     -X POST \
     -H "Content-Type: application/json" \
-    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" --arg mode "$OWNERSHIP_MODE" \
-      '{id: $id, project: $project, directory: $dir, ownership_mode: $mode, resume: true}')" \
+    --data-binary @- \
     > /dev/null
 fi
 

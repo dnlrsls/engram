@@ -196,6 +196,8 @@ Session binding is best-effort if the host times out the PreToolUse hook: normal
 2. Tells the agent: "FIRST ACTION REQUIRED — call `mem_session_summary` with this content before doing anything else"
 3. This ensures no work is lost when context is compressed
 
+Session-start and post-compaction hooks send registration JSON through curl's stdin (`--data-binary @-`), keeping UTF-8 identity bytes out of native command-line argument conversion on Windows. Registration fields and resume/ownership behavior are unchanged.
+
 **On session end**:
 The hook looks up the session first. If the original session has already ended (a resumed conversation), it ends the live continuation through `POST /runtime-sessions/end` with the session's persisted project, directory, and ownership mode; otherwise it calls `POST /sessions/{id}/end` as before. Both calls are bounded and fail open.
 
