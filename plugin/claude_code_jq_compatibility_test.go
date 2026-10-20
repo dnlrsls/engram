@@ -81,6 +81,12 @@ func TestClaudeHookResponseValidation(t *testing.T) {
 				{"valid project", `{"project":"client","project_source":"config"}`, "resolve_project /work", "client\n", 0},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
+					// The installed native Windows jq writes raw strings with CRLF;
+					// Bash printf and the POSIX jq compatibility delegate do not.
+					want := tc.want
+					if runtime.GOOS == "windows" && !emulated && tc.name == "valid project" {
+						want = "client\r\n"
+					}
 					var requests atomic.Int64
 					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						requests.Add(1)
@@ -117,9 +123,9 @@ func TestClaudeHookResponseValidation(t *testing.T) {
 							t.Fatalf("run helper: %v", err)
 						}
 					}
-					if gotExit != tc.wantExit || stdout.String() != tc.want || stderr.String() != "" || requests.Load() != 1 {
+					if gotExit != tc.wantExit || stdout.String() != want || stderr.String() != "" || requests.Load() != 1 {
 						t.Fatalf("helper exit=%d stdout=%q stderr=%q requests=%d, want exit=%d stdout=%q stderr empty requests=1",
-							gotExit, stdout.String(), stderr.String(), requests.Load(), tc.wantExit, tc.want)
+							gotExit, stdout.String(), stderr.String(), requests.Load(), tc.wantExit, want)
 					}
 				})
 			}

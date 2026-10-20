@@ -964,6 +964,25 @@ func healthyServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
+// Delegate only public read-only inspection to the candidate CLI. Each fixture
+// has an explicit local config, independent of the workspace and user config.
+func claudeLifecycleFixtureInspector(t *testing.T, cwd string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cwd, ".engram"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".engram", "config.json"), []byte(`{"project_name":"engram"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	for _, key := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "ENGRAM_DATA_DIR"} {
+		t.Setenv(key, root)
+	}
+	t.Setenv("ENGRAM_PROJECT", "")
+	binary := "'" + strings.ReplaceAll(filepath.ToSlash(buildCodexFixtureCLI(t)), "'", "'\"'\"'") + "'"
+	return "if [ \"$#\" -eq 2 ] && [ \"$1\" = hook ] && [ \"$2\" = resolve-hook-project ]; then exec " + binary + " \"$@\"; fi\n"
+}
+
 func TestSessionStartRegistersProjectOwnedClaudeSession(t *testing.T) {
 	requireHookBinaries(t)
 
@@ -992,12 +1011,13 @@ func TestSessionStartRegistersProjectOwnedClaudeSession(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
+	cwd := t.TempDir()
+	inspector := claudeLifecycleFixtureInspector(t, cwd)
 	stubDir := t.TempDir()
 	stub := filepath.Join(stubDir, "engram")
-	if err := os.WriteFile(stub, []byte("#!/bin/bash\nif [ \"$*\" = \"protocol-mode claude-code\" ]; then printf 'slim\\n'; fi\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(stub, []byte("#!/bin/bash\n"+inspector+"if [ \"$*\" = \"protocol-mode claude-code\" ]; then printf 'slim\\n'; fi\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write engram stub: %v", err)
 	}
-	cwd := t.TempDir()
 	runHook(t, "session-start.sh", `{"session_id":"claude-parent-session","cwd":`+strconv.Quote(cwd)+`}`,
 		map[string]string{
 			"ENGRAM_URL": srv.URL,
@@ -1113,7 +1133,7 @@ func TestSessionStartResumeKeepsLegacySharedOwnership(t *testing.T) {
 		wantMode string
 	}{
 		{"ended legacy shared root", `{"id":"claude-resumed","ownership_mode":"shared","ended_at":"2026-10-09 12:00:00"}`, "shared"},
-		{"ended project_owned root", `{"id":"claude-resumed","ownership_mode":"project_owned","ended_at":"2026-10-09 12:00:00"}`, "project_owned"},
+		{"ended project_owned root", `{"id":"claude-resumed","project":"engram","ownership_mode":"project_owned","ended_at":"2026-10-09 12:00:00"}`, "project_owned"},
 		{"live shared root", `{"id":"claude-resumed","ownership_mode":"shared"}`, "project_owned"},
 		{"other session", `{"id":"other","ownership_mode":"shared","ended_at":"2026-10-09 12:00:00"}`, "project_owned"},
 		{"unknown session", "", "project_owned"},
@@ -1143,11 +1163,13 @@ func TestSessionStartResumeKeepsLegacySharedOwnership(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
+			cwd := t.TempDir()
+			inspector := claudeLifecycleFixtureInspector(t, cwd)
 			stubDir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte("#!/bin/bash\nexit 0\n"), 0o755); err != nil {
+			if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte("#!/bin/bash\n"+inspector+"exit 0\n"), 0o755); err != nil {
 				t.Fatalf("write engram stub: %v", err)
 			}
-			runHook(t, "session-start.sh", `{"session_id":"claude-resumed","cwd":`+strconv.Quote(t.TempDir())+`,"source":"resume"}`,
+			runHook(t, "session-start.sh", `{"session_id":"claude-resumed","cwd":`+strconv.Quote(cwd)+`,"source":"resume"}`,
 				map[string]string{"ENGRAM_URL": srv.URL, "PATH": stubDir + ":" + os.Getenv("PATH")})
 
 			if registrations != 1 || !registered.Resume || registered.OwnershipMode != tc.wantMode {
@@ -1173,8 +1195,8 @@ func TestPostCompactionRegistersResumableClaudeSession(t *testing.T) {
 		wantMode string
 	}{
 		{"ended legacy shared root", `{"id":"claude-compacted","ownership_mode":"shared","ended_at":"2026-10-09 12:00:00"}`, "shared"},
-		{"ended project_owned root", `{"id":"claude-compacted","ownership_mode":"project_owned","ended_at":"2026-10-09 12:00:00"}`, "project_owned"},
-		{"live project_owned root", `{"id":"claude-compacted","ownership_mode":"project_owned"}`, "project_owned"},
+		{"ended project_owned root", `{"id":"claude-compacted","project":"engram","ownership_mode":"project_owned","ended_at":"2026-10-09 12:00:00"}`, "project_owned"},
+		{"live project_owned root", `{"id":"claude-compacted","project":"engram","ownership_mode":"project_owned"}`, "project_owned"},
 		{"unknown session", "", "project_owned"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1205,11 +1227,12 @@ func TestPostCompactionRegistersResumableClaudeSession(t *testing.T) {
 			}))
 			t.Cleanup(srv.Close)
 
+			cwd := t.TempDir()
+			inspector := claudeLifecycleFixtureInspector(t, cwd)
 			stubDir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte("#!/bin/bash\nexit 0\n"), 0o755); err != nil {
+			if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte("#!/bin/bash\n"+inspector+"exit 0\n"), 0o755); err != nil {
 				t.Fatalf("write engram stub: %v", err)
 			}
-			cwd := t.TempDir()
 			runHook(t, "post-compaction.sh", `{"session_id":"claude-compacted","cwd":`+strconv.Quote(cwd)+`,"source":"compact"}`,
 				map[string]string{"ENGRAM_URL": srv.URL, "PATH": stubDir + ":" + os.Getenv("PATH")})
 

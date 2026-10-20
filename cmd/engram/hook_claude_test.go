@@ -57,6 +57,24 @@ func claudeHookStdin(t *testing.T, input string, closed bool) *os.File {
 	return reader
 }
 
+// External shell fixtures use the real read-only inspector, never an installed CLI.
+func claudeFixtureProjectInspector(t *testing.T, root, project string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".engram")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(map[string]string{"project_name": project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), config, 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := "'" + strings.ReplaceAll(filepath.ToSlash(buildCompatibilityBinary(t)), "'", "'\"'\"'") + "'"
+	return "if [ \"$#\" -eq 2 ] && [ \"$1\" = hook ] && [ \"$2\" = resolve-hook-project ]; then exec " + binary + " \"$@\"; fi\n"
+}
+
 func TestClaudeEndedRegistrationCannotPersistBoundWrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("invokes the Claude SessionStart bash hook")
@@ -132,7 +150,7 @@ func TestClaudeEndedRegistrationCannotPersistBoundWrite(t *testing.T) {
 	if err := os.Mkdir(stubDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	stub := "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1\" = setup ] && [ \"$2\" = claude-code ] && [ \"$3\" = --mcp-only ]; then exit 0; fi\nprintf 'unexpected engram invocation\\n' >&2\nexit 99\n"
+	stub := "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1\" = setup ] && [ \"$2\" = claude-code ] && [ \"$3\" = --mcp-only ]; then exit 0; fi\n" + claudeFixtureProjectInspector(t, root, "project-a") + "printf 'unexpected engram invocation\\n' >&2\nexit 99\n"
 	if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte(stub), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -1393,7 +1411,7 @@ func TestClaudeShellLifecyclePersistsOnlyLiveHostWrites(t *testing.T) {
 	if err := os.Mkdir(stubDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	stub := "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1\" = setup ] && [ \"$2\" = claude-code ] && [ \"$3\" = --mcp-only ]; then exit 0; fi\nexit 99\n"
+	stub := "#!/bin/sh\nif [ \"$#\" -eq 3 ] && [ \"$1\" = setup ] && [ \"$2\" = claude-code ] && [ \"$3\" = --mcp-only ]; then exit 0; fi\n" + claudeFixtureProjectInspector(t, root, project) + "exit 99\n"
 	if err := os.WriteFile(filepath.Join(stubDir, "engram"), []byte(stub), 0700); err != nil {
 		t.Fatal(err)
 	}

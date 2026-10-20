@@ -92,7 +92,7 @@ func TestCodexUnixUserPromptSubmitValidatesObservationsAndFirstSaveThreshold(t *
 					t.Error("prompt must not register a session")
 					http.Error(w, "no registration", http.StatusConflict)
 				case "/sessions/" + sessionID:
-					_, _ = fmt.Fprintf(w, `{"started_at":%q}`, now.Add(-tt.sessionAge).Format(time.DateTime))
+					_, _ = fmt.Fprintf(w, `{"id":%q,"project":"test-project","ownership_mode":"project_owned","started_at":%q}`, sessionID, now.Add(-tt.sessionAge).Format(time.DateTime))
 				case "/observations":
 					_, _ = io.WriteString(w, tt.observations)
 				default:
@@ -162,6 +162,11 @@ func TestCodexUnixUserPromptSubmitDetachesPromptPersistencePipes(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprintf(w, `{"id":%q,"status":"resolved"}`, sessionID)
+		case "/sessions/" + sessionID:
+			if r.Method != http.MethodGet {
+				t.Errorf("unexpected owner method: %s", r.Method)
+			}
+			_, _ = fmt.Fprintf(w, `{"id":%q,"project":"test-project","ownership_mode":"project_owned"}`, sessionID)
 		case "/prompts":
 			postOnce.Do(func() { close(postStarted) })
 			<-releasePost
@@ -272,6 +277,11 @@ func TestCodexUnixUserPromptSubmitDetachesPromptPersistenceStdin(t *testing.T) {
 			_, _ = io.WriteString(w, `{"status":"ok","service":"engram","capabilities":{"runtime_session_resolution":true}}`)
 		case "/project/current":
 			_, _ = io.WriteString(w, `{"project":"test-project","project_source":"config"}`)
+		case "/sessions/stdin-pipe-test":
+			if r.Method != http.MethodGet {
+				t.Errorf("unexpected owner method: %s", r.Method)
+			}
+			_, _ = io.WriteString(w, `{"id":"stdin-pipe-test","project":"test-project","ownership_mode":"project_owned"}`)
 		case "/runtime-sessions/resolve":
 			_, _ = io.WriteString(w, `{"id":"stdin-pipe-test","status":"resolved"}`)
 		default:

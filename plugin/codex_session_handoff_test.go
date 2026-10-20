@@ -200,9 +200,15 @@ func codexDeliveredBinderContract(t *testing.T, binary, prose string) {
 		t.Fatalf("unexpected public hook command: %q", entry.Hooks[0].Command)
 	}
 	root := t.TempDir()
+	codexFixtureProject(t, root, "binder-probe")
 	var resolutions atomic.Int32
 	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/sessions/host":
+			if r.Method != http.MethodGet {
+				t.Errorf("unexpected binder owner method: %s", r.Method)
+			}
+			http.NotFound(w, r)
 		case "/health":
 			_, _ = io.WriteString(w, `{"status":"ok","service":"engram","capabilities":{"runtime_session_resolution":true}}`)
 		case "/project/current":
@@ -317,6 +323,11 @@ func TestCodexRegisteredSessionHandoff(t *testing.T) {
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					cwd := t.TempDir()
+					codexFixtureProject(t, cwd, "test-project")
+					inspectionCWD := cwd
+					if tc.noProject {
+						inspectionCWD = filepath.Join(cwd, "missing-client-checkout")
+					}
 					requests := make(chan map[string]any, 4)
 					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 						if r.URL.Path == "/external/sessions" || r.URL.Path == "/external/runtime-sessions/resolve" {
@@ -329,6 +340,11 @@ func TestCodexRegisteredSessionHandoff(t *testing.T) {
 							}
 						}
 						switch r.URL.Path {
+						case "/external/sessions/" + fmt.Sprint(tc.id):
+							if r.Method != http.MethodGet {
+								t.Errorf("unexpected owner lookup method: %s", r.Method)
+							}
+							http.NotFound(w, r)
 						case "/external/health":
 							_, _ = io.WriteString(w, `{"status":"ok","service":"engram","capabilities":{"runtime_session_resolution":true}}`)
 						case "/external/project/current":
@@ -402,7 +418,7 @@ func TestCodexRegisteredSessionHandoff(t *testing.T) {
 						}
 					}))
 					defer server.Close()
-					payload, err := json.Marshal(map[string]any{"session_id": tc.id, "cwd": cwd, "source": event, "secret": "raw-payload-secret"})
+					payload, err := json.Marshal(map[string]any{"session_id": tc.id, "cwd": inspectionCWD, "source": event, "secret": "raw-payload-secret"})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -532,6 +548,22 @@ func TestCodexRegisteredSessionHandoff(t *testing.T) {
 	}
 }
 
+// codexFixtureProject supplies an inspectable client identity, without relying on
+// the server's filesystem or its /project/current response.
+func codexFixtureProject(t *testing.T, cwd, project string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cwd, ".engram"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]string{"project_name": project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".engram", "config.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 var codexFixtureBinaries sync.Map
 var codexFixtureOnce sync.Once
 var codexFixturePath, codexFixtureDir string
@@ -614,7 +646,7 @@ func codexHandoffEnv(t *testing.T, cwd, serverURL string, binary ...string) []st
 		}
 		writeTool("engram", `[ "$#" -eq 2 ] && [ "$1" = hook ] && [ "$ENGRAM_URL" = `+quote(strings.TrimSpace(serverURL))+` ] || { `+reject+`; }
 case "$2" in
-  codex-register|codex-resolve) [ "$ENGRAM_HOOK_OUTPUT" = json ] || { `+reject+`; } ;;
+  codex-register|codex-resolve) { [ "$ENGRAM_HOOK_OUTPUT" = json ] || [ "$ENGRAM_HOOK_OUTPUT" = json-project ]; } || { `+reject+`; } ;;
   codex-session-end) ;;
   *) `+reject+` ;;
 esac

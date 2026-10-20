@@ -26,6 +26,13 @@ func TestCodexUnixSessionEndAdapter(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			switch r.URL.Path {
+			case "/sessions/custom-port", "/sessions/session id/with?characters#%", "/sessions/slow":
+				http.NotFound(w, r)
+				return
+			}
+		}
 		if r.URL.Path == "/project/current" {
 			_, _ = io.WriteString(w, `{"project":"end-project","project_source":"config"}`)
 			return
@@ -224,6 +231,7 @@ func requireCodexUnixTools(t *testing.T, bashPath string) {
 func assertSilentCodexUnixSessionEnd(t *testing.T, bashPath, adapterPath, input string, port *string, pathPrefix string) {
 	t.Helper()
 	cwd := t.TempDir()
+	codexFixtureProject(t, cwd, "end-project")
 	var payload map[string]any
 	if json.Unmarshal([]byte(input), &payload) == nil && payload != nil {
 		if _, present := payload["cwd"]; !present {
