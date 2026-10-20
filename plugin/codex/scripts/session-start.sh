@@ -55,10 +55,8 @@ if ! engram_health_matches_instance "$ENGRAM_INSTANCE_ID"; then
 fi
 fi
 
-PROJECT=$(resolve_project "$CWD") || PROJECT=""
-
-# Register and retain only the server-confirmed runtime identity.
-SESSION_HANDOFF=$(engram_session_handoff "$INPUT" "$PROJECT" "$CWD" codex-register) && SESSION_REGISTERED=1 || SESSION_REGISTERED=0
+# Register once in Go and retain its selected project for context.
+engram_lifecycle_handoff "$INPUT" "$CWD" codex-register && SESSION_REGISTERED=1 || SESSION_REGISTERED=0
 
 # Auto-import git-synced chunks
 if [ -f "${CWD}/.engram/manifest.json" ]; then

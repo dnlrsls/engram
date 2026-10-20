@@ -29,11 +29,39 @@ resolve_project() {
   ' 2>/dev/null
 }
 
+# Lifecycle context consumes the native selected project, not another shell
+# inspection. Assign in the caller shell so PROJECT survives handoff rendering.
+engram_lifecycle_handoff() {
+  local input="$1" dir="$2" action="$3" effective=""
+  PROJECT=""
+  if [ -n "${ENGRAM_EXTERNAL_URL:-}" ]; then
+    effective=$(printf '%s' "$input" | ENGRAM_URL="$ENGRAM_EXTERNAL_URL" ENGRAM_HOOK_OUTPUT=json-project engram hook "$action" 2>/dev/null) || effective=""
+    PROJECT=$(printf '%s' "$effective" | jq -ers '
+      (if length == 1 then .[0] else error("invalid lifecycle result") end) |
+      # Project context does not confirm a writable runtime identity.
+      if (.session_id | type) == "string"
+        and (.project | type) == "string"
+        and (.project | gsub("^[[:space:]]+|[[:space:]]+$"; "") | length) > 0
+      then .project else error("invalid lifecycle result") end
+    ' 2>/dev/null) || PROJECT=""
+    SESSION_HANDOFF=$(engram_session_handoff "$input" "$PROJECT" "$dir" "$action" "$effective")
+  else
+    PROJECT=$(resolve_project "$dir") || PROJECT=""
+    SESSION_HANDOFF=$(engram_session_handoff "$input" "$PROJECT" "$dir" "$action")
+  fi
+}
+
 # Transport the server-confirmed runtime identity; never choose a session here.
 engram_session_handoff() {
   local input="$1" project="$2" dir="$3" action="$4" effective identity=""
   if [ -n "$project" ]; then
-    effective=$(printf '%s' "$input" | ENGRAM_URL="$ENGRAM_URL" ENGRAM_HOOK_OUTPUT=json engram hook "$action" 2>/dev/null) || effective=""
+    if [ "${5+x}" = x ]; then
+      effective="$5"
+    else
+      # A present-but-blank original URL must not become external opt-in.
+      # Callers without that marker retain the existing helper contract.
+      effective=$(printf '%s' "$input" | ENGRAM_URL="${ENGRAM_EXTERNAL_URL-$ENGRAM_URL}" ENGRAM_HOOK_OUTPUT=json engram hook "$action" 2>/dev/null) || effective=""
+    fi
     identity=$(printf '%s' "$effective" | jq -esc '
       if length == 1 and (.[0].session_id | type) == "string" and (.[0].session_id | length) > 0
       then {session_id: .[0].session_id} else error("invalid identity") end

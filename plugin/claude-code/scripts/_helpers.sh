@@ -150,3 +150,37 @@ resolve_project() {
     return 1
   }
 }
+
+# Dedicated session/context seam; capture and prompt callers keep resolve_project.
+# Assign PROJECT and SESSION together so registration reuses the same owner read.
+resolve_lifecycle_project() {
+  local input="$1" dir="$2" id="$3" encoded_id response
+  PROJECT=""
+  SESSION=""
+  if [ -z "$ENGRAM_EXTERNAL_URL" ]; then
+    PROJECT=$(resolve_project "$dir") || PROJECT=""
+  fi
+  if [ -n "$id" ] && { [ -n "$ENGRAM_EXTERNAL_URL" ] || [ -n "$PROJECT" ]; }; then
+    encoded_id=$(printf '%s' "$id" | jq -sRr @uri 2>/dev/null)
+    if [ -n "$encoded_id" ]; then
+      SESSION=$(engram_curl -sf "${ENGRAM_URL}/sessions/${encoded_id}" --max-time 1 2>/dev/null) || SESSION=""
+    fi
+  fi
+  if [ -n "$ENGRAM_EXTERNAL_URL" ]; then
+    PROJECT=$(printf '%s' "$SESSION" | jq -er --arg id "$id" '
+      if .id == $id and .ownership_mode == "project_owned"
+        and (.project | type) == "string"
+        and (.project | gsub("^[[:space:]]+|[[:space:]]+$"; "") | length) > 0
+      then .project else error("no registered owner") end
+    ' 2>/dev/null) || PROJECT=""
+    if [ -z "$PROJECT" ]; then
+      response=$(printf '%s' "$input" | engram hook resolve-hook-project 2>/dev/null) || response=""
+      PROJECT=$(printf '%s' "$response" | jq -er '
+        if (.project | type) == "string"
+          and (.project | gsub("^[[:space:]]+|[[:space:]]+$"; "") | length) > 0
+        then .project else error("unusable client project") end
+      ' 2>/dev/null) || PROJECT=""
+    fi
+  fi
+  return 0
+}

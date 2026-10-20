@@ -12,7 +12,7 @@ source "${SCRIPT_DIR}/_helpers.sh"
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-PROJECT=$(resolve_project "$CWD") || PROJECT=""
+resolve_lifecycle_project "$INPUT" "$CWD" "$SESSION_ID"
 
 # Ensure session exists. Claude keeps the session ID across compaction as it
 # does on --resume, so the root may already be ended; resume=true lets the
@@ -23,11 +23,6 @@ if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
   # Roots created before Claude registered project_owned sessions are shared;
   # resuming one keeps that mode so its continuation stays resolvable.
   OWNERSHIP_MODE="project_owned"
-  ENCODED_SESSION_ID=$(printf '%s' "$SESSION_ID" | jq -sRr @uri 2>/dev/null)
-  SESSION=""
-  if [ -n "$ENCODED_SESSION_ID" ]; then
-    SESSION=$(engram_curl -sf "${ENGRAM_URL}/sessions/${ENCODED_SESSION_ID}" --max-time 1 2>/dev/null)
-  fi
   if [ -n "$SESSION" ] && printf '%s' "$SESSION" \
     | jq -e --arg id "$SESSION_ID" '.id == $id and .ended_at != null and .ownership_mode == "shared"' >/dev/null 2>&1; then
     OWNERSHIP_MODE="shared"

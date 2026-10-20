@@ -17,10 +17,8 @@ source "${SCRIPT_DIR}/_helpers.sh"
 # Read hook input from stdin
 INPUT=$(cat)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-PROJECT=$(resolve_project "$CWD") || PROJECT=""
-
-# Register and retain only the server-confirmed runtime identity.
-SESSION_HANDOFF=$(engram_session_handoff "$INPUT" "$PROJECT" "$CWD" codex-resolve) && REGISTERED=1 || REGISTERED=0
+# Resolve once in Go and retain its selected project for context.
+engram_lifecycle_handoff "$INPUT" "$CWD" codex-resolve && REGISTERED=1 || REGISTERED=0
 
 # Fetch context from previous sessions
 CONTEXT=""
