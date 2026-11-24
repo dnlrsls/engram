@@ -1,0 +1,53 @@
+{
+  "name": "Issue 1967 macOS ARM64 benchmark",
+  "on": {
+    "pull_request": {
+      "branches": [
+        "ci/1967-macos-base"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "jobs": {
+    "native-stats-health": {
+      "runs-on": "macos-15",
+      "timeout-minutes": 20,
+      "env": {
+        "GOTOOLCHAIN": "local",
+        "SOURCE_REVISION": "5f17b40d116700de4dfd737b036d18cfad75c515"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+          "with": {
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16",
+          "with": {
+            "go-version": "1.26.11",
+            "cache": false
+          }
+        },
+        {
+          "name": "Run disposable benchmark",
+          "shell": "bash",
+          "run": "set -euo pipefail\nuname -sm\nsw_vers\npython3 --version\ngo version\nsource_checkout=\"$RUNNER_TEMP/engram-source\"\ngit init -q \"$source_checkout\"\ngit -C \"$source_checkout\" fetch --depth=1 https://github.com/Gentleman-Programming/engram.git \"$SOURCE_REVISION\"\ngit -C \"$source_checkout\" checkout --detach FETCH_HEAD\nmkdir results\npython3 -B scripts/macos-arm64-stats-health.py --repo \"$source_checkout\" \\\n  --revision \"$SOURCE_REVISION\" --rounds 2 \\\n  --output \"$GITHUB_WORKSPACE/results/macos-arm64-stats-health.json\"\n"
+        },
+        {
+          "name": "Upload benchmark results",
+          "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+          "with": {
+            "name": "issue-1967-macos-arm64",
+            "path": "results/macos-arm64-stats-health.json",
+            "if-no-files-found": "error",
+            "retention-days": 14
+          }
+        }
+      ]
+    }
+  }
+}
